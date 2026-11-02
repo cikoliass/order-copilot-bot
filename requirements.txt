@@ -1,0 +1,12 @@
+aiogram
+openai
+pydantic
+pydantic-settings
+rapidfuzz
+sqlalchemy
+aiosqlite
+asyncpg
+redis
+httpx
+fastapi
+uvicorn[standard]
