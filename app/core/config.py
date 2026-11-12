@@ -1,6 +1,6 @@
 from pathlib import Path
 from typing import Optional
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -13,51 +13,112 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Telegram Bot
-    BOT_TOKEN: str = Field(..., description="Токен Telegram-бота от @BotFather")
+    # Core System
+    APP_ENV: str = Field(default="production", description="Окружение приложения (production/development)")
+    APP_PORT: int = Field(default=8001, description="Порт входящего шлюза FastAPI")
+    APP_HOST: str = Field(default="127.0.0.1", description="Хост входящего шлюза FastAPI")
+    WEBHOOK_SECRET: str = Field(default="super_secret_webhook_salt_123", description="Секретный ключ вебхуков")
 
-    # Groq API (OpenAI-совместимый клиент)
-    GROQ_API_KEY: str = Field(..., description="API-ключ Groq")
-    GROQ_BASE_URL: str = Field(
-        default="https://api.groq.com/openai/v1",
-        description="Base URL для Groq API",
+    # Yandex Cloud (152-ФЗ)
+    YANDEX_API_KEY: str = Field(default="", description="API-ключ сервисного аккаунта Yandex Cloud")
+    YANDEX_FOLDER_ID: str = Field(default="", description="Идентификатор каталога в Yandex Cloud")
+    YANDEX_STT_URL: str = Field(
+        default="https://stt.api.cloud.yandex.net/speech/v1/stt:recognize",
+        description="URL Yandex SpeechKit v1 STT",
     )
-    LLM_MODEL: str = Field(
-        default="openai/gpt-oss-20b",
-        description="Модель в Groq для извлечения сущностей из заказа",
+    YANDEX_GPT_URL: str = Field(
+        default="https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+        description="URL Yandex Foundation Models Completion",
     )
-    WHISPER_MODEL: str = Field(
-        default="whisper-large-v3",
-        description="Модель Whisper в Groq для распознавания голосовых",
+    YANDEX_GPT_MODEL: str = Field(
+        default="yandexgpt/latest",
+        description="Модель YandexGPT: yandexgpt/latest или yandexgpt-lite/latest",
     )
 
-    # Хранилище и БД
+    # State Storage & Database
+    REDIS_URL: str = Field(
+        default="redis://127.0.0.1:6379/0",
+        description="URL подключения к Redis",
+    )
     DATABASE_URL: str = Field(
-        default=f"sqlite+aiosqlite:///{BASE_DIR / 'horeca_orders.db'}",
-        description="Строка подключения SQLAlchemy 2.0",
+        default=f"sqlite+aiosqlite:///{BASE_DIR / 'orders_enterprise.db'}",
+        description="URL подключения к БД (SQLite/PostgreSQL)",
     )
-    REDIS_URL: Optional[str] = Field(default=None)
 
-    # Интеграция с 1С
-    USE_MOCK_1C: bool = Field(
-        default=True,
-        description="Использовать Mock-сервер вместо реальной 1С",
+    # Telegram
+    TELEGRAM_BOT_TOKEN: str = Field(
+        default="",
+        validation_alias=AliasChoices("TELEGRAM_BOT_TOKEN", "BOT_TOKEN"),
+        description="Токен Telegram Bot API",
     )
+    TELEGRAM_WEBHOOK_URL: str = Field(default="", description="Публичный URL вебхука Telegram")
+    TELEGRAM_PROXY: Optional[str] = Field(
+        default=None,
+        description="HTTP/SOCKS5 прокси для обращений к Telegram Bot API (например: http://127.0.0.1:17890)",
+    )
+
+    # VK Callback API
+    VK_GROUP_TOKEN: str = Field(default="", description="Токен группы ВКонтакте")
+    VK_CONFIRMATION_CODE: str = Field(default="", description="Код подтверждения Callback API ВКонтакте")
+    VK_SECRET_KEY: str = Field(default="", description="Секретный ключ Callback API ВКонтакте")
+
+    # WhatsApp (Green-API)
+    GREEN_API_INSTANCE_ID: str = Field(default="", description="Instance ID в Green-API")
+    GREEN_API_TOKEN: str = Field(default="", description="API токен Green-API")
+
+    # Viber
+    VIBER_AUTH_TOKEN: str = Field(default="", description="Токен чат-бота Viber")
+    VIBER_SENDER_NAME: str = Field(default="HoReCa Order Co-Pilot", description="Имя отправителя в Viber")
+
+    # MAX Corporate Messenger
+    MAX_BOT_TOKEN: str = Field(default="", description="Токен корпоративного бота MAX")
+    MAX_API_BASE_URL: str = Field(default="https://platform-api2.max.ru", description="Базовый URL API MAX")
+
+    # 1C Integration
+    USE_MOCK_1C: bool = Field(default=True, description="Использовать Mock 1C вместо боевого сервера")
     MOCK_1C_URL: str = Field(
         default="http://127.0.0.1:8080/api/v1/mock-1c/orders",
-        description="Эндпоинт создания заказа в Mock 1C",
+        description="Эндпоинт Mock 1C",
     )
     ONEC_URL: str = Field(
-        default="http://localhost/horeca1c/hs/horeca/orders",
-        description="Эндпоинт создания заказа в реальной 1С",
+        default="http://127.0.0.1:8080/api/v1/mock-1c/orders",
+        description="Эндпоинт создания заказа в 1С (боевой или Mock)",
     )
-    MOCK_1C_TIMEOUT: float = Field(default=10.0)
+    ONEC_USER: Optional[str] = Field(default=None, description="Пользователь HTTP-сервиса 1С")
+    ONEC_PASSWORD: Optional[str] = Field(default=None, description="Пароль HTTP-сервиса 1С")
+    ONEC_TIMEOUT_SEC: float = Field(default=5.0, description="Таймаут обращения к 1С в секундах")
 
-    # Каталог и параметры матчинга
-    CATALOG_PATH: Path = Field(
-        default=BASE_DIR / "app" / "data" / "catalog.json",
+    # Bitrix24 Integration
+    BITRIX_WEBHOOK_URL: Optional[str] = Field(
+        default=None,
+        description="Входящий вебхук REST API Битрикс24",
     )
-    CONFIDENCE_THRESHOLD: float = Field(default=0.85, ge=0.0, le=1.0)
+    BITRIX_TIMEOUT_SEC: float = Field(default=5.0, description="Таймаут обращения к Битрикс24 в секундах")
+
+    # Matching & Logic
+    CONFIDENCE_THRESHOLD: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description="Порог уверенности сопоставления номенклатуры (🟢 / 🟡)",
+    )
+    LOCK_TIMEOUT_SEC: int = Field(default=60, description="Время жизни распределенного лока (TTL)")
+    OUTBOX_POLL_INTERVAL_SEC: int = Field(
+        default=60,
+        description="Интервал проверки Outbox-очереди в секундах",
+    )
+    CHECK_PACK_MULTIPLES: bool = Field(
+        default=True,
+        description="Контролировать кратность заводских упаковок (ящиков/коробок)",
+    )
+    SUGGEST_OUT_OF_STOCK_ANALOGS: bool = Field(
+        default=True,
+        description="Автоматически предлагать аналоги при нулевом остатке товара на складе",
+    )
+    ENABLE_POLLING_BRIDGES: bool = Field(
+        default=False,
+        description="Включить фоновые long-polling мосты (для локальной разработки без вебхуков)",
+    )
 
 
 settings = Settings()

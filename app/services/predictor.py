@@ -1,60 +1,27 @@
-import json
-import sqlite3
 import logging
 from collections import defaultdict
-from pathlib import Path
 from statistics import median
 from typing import Any
-
-from app.services.matcher import MatchedItem, MatchStatus, catalog_matcher
+from app.core.database import get_user_order_history
+from app.services.matcher import catalog_matcher
+from app.services.schemas import MatchStatus, MatchedItem
 
 logger = logging.getLogger(__name__)
 
-DB_PATH = Path(__file__).resolve().parent.parent.parent / "horeca_orders.db"
-
 
 class OrderPredictor:
-    """Анализирует прошлые заказы пользователя в SQLite и формирует идеальный заказ."""
+    """
+    Интеллектуальный модуль прогнозирования заказов (Частотно-объемный скоринг).
+    Формирует «Идеальный заказ» и подсказывает «Забытые товары».
+    """
 
-    def _fetch_user_orders(self, telegram_user_id: str) -> list[list[dict[str, Any]]]:
-        if not DB_PATH.exists():
-            return []
-
-        orders_items = []
-        try:
-            conn = sqlite3.connect(DB_PATH)
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [r[0] for r in cursor.fetchall()]
-
-            for table in tables:
-                try:
-                    cursor.execute(f"PRAGMA table_info({table})")
-                    columns = [row[1] for row in cursor.fetchall()]
-                    # Колонка с товарами может называться items_json или items_data
-                    json_col = next((c for c in ("items_json", "items_data") if c in columns), None)
-                    if not json_col or "telegram_user_id" not in columns:
-                        continue
-
-                    cursor.execute(
-                        f"SELECT {json_col} FROM {table} WHERE telegram_user_id = ? ORDER BY id DESC LIMIT 50",
-                        (str(telegram_user_id),),
-                    )
-                    for (raw_json,) in cursor.fetchall():
-                        if raw_json:
-                            parsed = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
-                            if isinstance(parsed, list) and parsed:
-                                orders_items.append(parsed)
-                except Exception as table_exc:
-                    logger.warning("Ошибка чтения таблицы %s при прогнозе: %s", table, table_exc)
-            conn.close()
-        except Exception as exc:
-            logger.error("Ошибка чтения БД для прогноза: %s", exc)
-
-        return orders_items
-
-    def predict_ideal_order(self, telegram_user_id: str, top_k: int = 6) -> list[MatchedItem]:
-        history = self._fetch_user_orders(telegram_user_id)
+    async def predict_ideal_order(
+        self, session_id: str, top_k: int = 6, min_frequency: float = 0.0
+    ) -> list[MatchedItem]:
+        """
+        Формирует список рекомендуемых товаров на основе частоты и медианных объемов закупок клиента.
+        """
+        history = await get_user_order_history(session_id, limit=50)
         if not history:
             return []
 
@@ -64,83 +31,106 @@ class OrderPredictor:
         )
 
         for order in history:
-            seen_in_order = set()
-            for item in order:
-                sku = item.get("sku_id") or item.get("sku")
+            seen_skus = set()
+            for it in order:
+                sku = it.get("sku_id") or it.get("sku")
                 if not sku:
                     continue
-                qty = float(item.get("final_quantity") or item.get("qty") or 1.0)
-                if sku not in seen_in_order:
+                qty = float(it.get("final_quantity") or it.get("qty") or 1.0)
+                if sku not in seen_skus:
                     sku_stats[sku]["count"] += 1
-                    seen_in_order.add(sku)
+                    seen_skus.add(sku)
                 sku_stats[sku]["quantities"].append(qty)
                 if sku_stats[sku]["last_item"] is None:
-                    sku_stats[sku]["last_item"] = item
+                    sku_stats[sku]["last_item"] = it
 
-        ranked_skus = sorted(
-            sku_stats.items(),
+        if not sku_stats:
+            return []
+
+        # Фильтрация по минимальной частоте
+        filtered_stats = {
+            sku: info
+            for sku, info in sku_stats.items()
+            if (info["count"] / total_orders) >= min_frequency
+        }
+        if not filtered_stats:
+            return []
+
+        # Ранжирование по частоте встречаемости в заказах и объему
+        ranked = sorted(
+            filtered_stats.items(),
             key=lambda kv: (kv[1]["count"] / total_orders, len(kv[1]["quantities"])),
             reverse=True,
         )
 
         cat_map = {item.sku_id: item for item in catalog_matcher.catalog}
+        result: list[MatchedItem] = []
 
-        def _build_matched_item(sku: str, info: dict[str, Any]) -> MatchedItem:
-            freq = info["count"] / total_orders
-            optimal_qty = round(median(info["quantities"]), 2)
-            sample = info["last_item"]
-
+        for sku, info in ranked[:top_k]:
             cat_item = cat_map.get(sku)
+            sample = info["last_item"]
+            opt_qty = round(median(info["quantities"]), 2)
+
             if cat_item:
                 price = cat_item.price
-                base_unit = cat_item.base_unit
-                catalog_name = cat_item.name
+                unit = cat_item.base_unit
+                name = cat_item.name
             else:
-                price = float(sample.get("price") or 100.0)
-                base_unit = sample.get("base_unit") or "шт"
-                catalog_name = sample.get("catalog_name") or sample.get("raw_name") or "Товар"
+                price = float(sample.get("price") or 0.0)
+                unit = sample.get("base_unit") or sample.get("unit") or "шт"
+                name = sample.get("catalog_name") or sample.get("name") or "Товар"
 
-            return MatchedItem(
-                raw_name=catalog_name,
-                raw_quantity=optimal_qty,
-                raw_unit=base_unit,
-                sku_id=sku,
-                catalog_name=catalog_name,
-                base_unit=base_unit,
-                final_quantity=optimal_qty,
-                price=price,
-                total_sum=round(optimal_qty * price, 2),
-                confidence=round(min(0.99, 0.70 + freq * 0.29), 2),
-                status=MatchStatus.RECOGNIZED,
-                recalculation_hint=f"В {int(freq * 100)}% ваших заказов",
-                note="Подобрано ИИ по истории закупок",
+            total = round(opt_qty * price, 2)
+            freq_percent = int((info["count"] / total_orders) * 100)
+
+            result.append(
+                MatchedItem(
+                    raw_name=name,
+                    raw_quantity=opt_qty,
+                    raw_unit=unit,
+                    sku_id=sku,
+                    catalog_name=name,
+                    final_quantity=opt_qty,
+                    base_unit=unit,
+                    price=price,
+                    total_sum=total,
+                    confidence=1.0,
+                    status=MatchStatus.RECOGNIZED,
+                    recalculation_hint=f"в {freq_percent}% ваших заказов",
+                )
             )
 
-        predicted_items: list[MatchedItem] = []
-        for sku, info in ranked_skus[:top_k]:
-            freq = info["count"] / total_orders
-            # Если заказов много (>=4), отсекаем совсем редкие разовые позиции (< 15%),
-            # если только они не были заказаны хотя бы 2 раза
-            if total_orders >= 4 and freq < 0.15 and info["count"] < 2:
-                continue
+        return result
 
-            predicted_items.append(_build_matched_item(sku, info))
-
-        # Фолбэк: если строгий фильтр частоты отсек все позиции (например, все заказы были разными),
-        # берем самые частые позиции пользователя
-        if not predicted_items and ranked_skus:
-            for sku, info in ranked_skus[:min(top_k, 3)]:
-                predicted_items.append(_build_matched_item(sku, info))
-
-        return predicted_items
-
-    def suggest_missing_items(
-        self, telegram_user_id: str, current_items: list[MatchedItem], max_suggestions: int = 3
+    async def suggest_missing_items(
+        self,
+        session_id: str,
+        current_items: list[MatchedItem],
+        min_frequency: float = 0.40,
+        top_k: int = 3,
     ) -> list[MatchedItem]:
-        ideal_items = self.predict_ideal_order(telegram_user_id, top_k=10)
+        """
+        Анализирует регулярные закупки пользователя и находит товары с частотой >= min_frequency,
+        которые он обычно заказывает, но забыл указать в текущей корзине.
+        """
+        ideal = await self.predict_ideal_order(session_id, top_k=10, min_frequency=min_frequency)
+        if not ideal:
+            return []
+
         current_skus = {it.sku_id for it in current_items if it.sku_id}
-        missing = [it for it in ideal_items if it.sku_id not in current_skus]
-        return missing[:max_suggestions]
+        current_names = {it.raw_name.lower().strip() for it in current_items}
+
+        missing: list[MatchedItem] = []
+        for item in ideal:
+            if item.sku_id and item.sku_id in current_skus:
+                continue
+            if item.catalog_name and item.catalog_name.lower().strip() in current_names:
+                continue
+            missing.append(item)
+            if len(missing) >= top_k:
+                break
+
+        return missing
 
 
 order_predictor = OrderPredictor()

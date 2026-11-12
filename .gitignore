@@ -1,4 +1,14 @@
 venv/
+.venv/
 .env
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+*.db
+*.sqlite3
+horeca_orders.db
+orders_enterprise.db
+.vscode/
+.idea/
+.pytest_cache/
+*.log

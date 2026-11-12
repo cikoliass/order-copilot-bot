@@ -1,0 +1,56 @@
+version: "3.8"
+
+services:
+  backend:
+    build: .
+    container_name: order_copilot_backend
+    command: python -m app.main
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    environment:
+      - APP_PORT=8001
+      - APP_HOST=0.0.0.0
+      - REDIS_URL=redis://:redis_secure_pass_123@redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://copilot:copilot_pass@db:5432/orders_enterprise
+      - MOCK_1C_URL=http://mock-1c:8080/api/v1/mock-1c/orders
+    depends_on:
+      - redis
+      - db
+      - mock-1c
+    restart: unless-stopped
+
+  mock-1c:
+    build: .
+    container_name: order_copilot_mock_1c
+    command: python -m mock_server.main
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: order_copilot_redis
+    command: ["redis-server", "--requirepass", "redis_secure_pass_123"]
+    # Порт закрыт внутри docker-сети для изоляции
+    expose:
+      - "6379"
+    restart: unless-stopped
+
+  db:
+    image: postgres:16-alpine
+    container_name: order_copilot_postgres
+    environment:
+      POSTGRES_DB: orders_enterprise
+      POSTGRES_USER: copilot
+      POSTGRES_PASSWORD: copilot_pass
+    # Порт закрыт внутри docker-сети для безопасности
+    expose:
+      - "5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  pgdata:
