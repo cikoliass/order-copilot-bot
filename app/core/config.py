@@ -18,6 +18,14 @@ class Settings(BaseSettings):
     APP_PORT: int = Field(default=8001, description="Порт входящего шлюза FastAPI")
     APP_HOST: str = Field(default="127.0.0.1", description="Хост входящего шлюза FastAPI")
     WEBHOOK_SECRET: str = Field(default="super_secret_webhook_salt_123", description="Секретный ключ вебхуков")
+    ALLOWED_ORIGINS: list[str] = Field(
+        default_factory=lambda: ["*"],
+        description="Список разрешенных CORS origins",
+    )
+    MAX_REQUEST_BODY_SIZE_MB: int = Field(
+        default=25,
+        description="Максимальный размер тела входящего HTTP-запроса в мегабайтах (защита от OOM/DoS)",
+    )
 
     # Yandex Cloud (152-ФЗ)
     YANDEX_API_KEY: str = Field(default="", description="API-ключ сервисного аккаунта Yandex Cloud")

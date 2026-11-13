@@ -5,7 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 import httpx
-from fastapi import FastAPI, status
+from fastapi import FastAPI, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.gateway import process_inbound_core, router as gateway_router
 from app.core.config import settings
@@ -390,13 +390,47 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Безопасная настройка CORS: исключаем одновременное использование allow_origins=["*"] и allow_credentials=True
+cors_origins = settings.ALLOWED_ORIGINS
+allow_wildcard = "*" in cors_origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=cors_origins,
+    allow_credentials=not allow_wildcard,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers_middleware(request: Request, call_next):
+    """Принудительная установка заголовков безопасности HTTP (защита от XSS, clickjacking, MIME-sniffing)."""
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["X-XSS-Protection"] = "1; mode=block"
+    response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+    return response
+
+
+@app.middleware("http")
+async def request_body_size_limiter(request: Request, call_next):
+    """Защита от DoS и исчерпания памяти при отправке аномально больших payload."""
+    max_bytes = settings.MAX_REQUEST_BODY_SIZE_MB * 1024 * 1024
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max_bytes:
+                return Response(
+                    content=json.dumps({"detail": f"Payload Too Large: request body exceeds {settings.MAX_REQUEST_BODY_SIZE_MB}MB limit"}),
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    media_type="application/json",
+                )
+        except ValueError:
+            pass
+    return await call_next(request)
+
 
 app.include_router(gateway_router)
 

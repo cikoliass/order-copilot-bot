@@ -22,6 +22,8 @@ def _convert_audio_with_ffmpeg(audio_bytes: bytes) -> tuple[bytes, str]:
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-y",
+                "-nostdin",
+                "-protocol_whitelist", "pipe,file",
                 "-i", "pipe:0",
                 "-vn",
                 "-c:a", "libopus",

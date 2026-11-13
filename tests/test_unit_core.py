@@ -1,10 +1,15 @@
+import html
 import pytest
+import httpx
 from app.api.gateway import (
+    _escape_like_wildcards,
     _find_cart_item_index,
     _is_safe_url_for_download,
     classify_action_text,
     format_copilot_card,
 )
+from app.main import app as main_app
+from mock_server.main import SAVED_ORDERS, view_orders_journal
 from app.services.bitrix_sync import _parse_description_meta
 from app.services.matcher import CatalogMatcher
 from app.services.schemas import CatalogSKU, MatchStatus, MatchedItem, RawItem
@@ -133,9 +138,80 @@ def test_ssrf_safety_checker():
     assert not _is_safe_url_for_download("ftp://example.com/voice.ogg")
     assert not _is_safe_url_for_download("file:///etc/passwd")
 
+    # Защита от DNS Rebinding (домены, резолвящиеся в loopback/private)
+    assert not _is_safe_url_for_download("http://127.0.0.1.nip.io/audio.ogg")
+
+    # Защита от Userinfo в URL (обход парсера через @)
+    assert not _is_safe_url_for_download("http://admin:secret@storage.yandexcloud.net/audio.ogg")
+
+    # Защита от сканирования внутренних портов (SSH, Redis, DB)
+    assert not _is_safe_url_for_download("http://storage.yandexcloud.net:22/audio.ogg")
+    assert not _is_safe_url_for_download("http://storage.yandexcloud.net:6379/audio.ogg")
+
     # Разрешены публичные HTTP/HTTPS ссылки
     assert _is_safe_url_for_download("https://storage.yandexcloud.net/bucket/audio.ogg")
     assert _is_safe_url_for_download("https://platform-api2.max.ru/files/audio.ogg")
+
+
+def test_escape_like_wildcards():
+    # Защита от wildcard injection в SQL LIKE
+    raw = "ЗК-1094%_\\test"
+    escaped = _escape_like_wildcards(raw)
+    assert escaped == "ЗК-1094\\%\\_\\\\test"
+
+
+@pytest.mark.asyncio
+async def test_mock_server_xss_protection():
+    # Проверка защиты от Stored XSS в HTML-дашборде 1С
+    malicious_order = {
+        "doc_num": "<script>alert('doc')</script>",
+        "client_id": "<img src=x onerror=alert('xss')>",
+        "delivery_date": "<b onmouseover=alert(1)>срок</b>",
+        "total_amount": 100.0,
+        "state": "<script>evil()</script>",
+        "created_at": "01.01.2026",
+        "items": [
+            {
+                "sku_id": "<script>xss()</script>",
+                "name": "<svg onload=alert(1)>",
+                "qty": 1.0,
+                "unit": "<script>",
+                "price": 100.0,
+            }
+        ],
+    }
+    SAVED_ORDERS.insert(0, malicious_order)
+    response = await view_orders_journal()
+    html_text = response.body.decode("utf-8")
+
+    # Убеждаемся, что сырые теги скриптов и вредоносных обработчиков отсутствуют в HTML
+    assert "<script>alert('doc')</script>" not in html_text
+    assert "<img src=x onerror=alert('xss')>" not in html_text
+    assert "<script>evil()</script>" not in html_text
+    assert "<svg onload=alert(1)>" not in html_text
+
+    # Убеждаемся, что спецсимволы корректно экранированы
+    assert "&lt;script&gt;alert(&#x27;doc&#x27;)&lt;/script&gt;" in html_text or "&lt;script&gt;" in html_text
+    assert "&lt;img src=x" in html_text
+
+
+@pytest.mark.asyncio
+async def test_security_headers_and_body_size_limit():
+    transport = httpx.ASGITransport(app=main_app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        # Проверяем заголовки безопасности
+        resp = await client.get("/")
+        assert resp.status_code == 200
+        assert resp.headers["X-Content-Type-Options"] == "nosniff"
+        assert resp.headers["X-Frame-Options"] == "DENY"
+        assert resp.headers["Referrer-Policy"] == "strict-origin-when-cross-origin"
+        assert "1; mode=block" in resp.headers["X-XSS-Protection"]
+
+        # Проверяем лимит размера тела запроса (отправка огромного Content-Length)
+        huge_headers = {"Content-Length": str(30 * 1024 * 1024), "Content-Type": "application/json"}
+        huge_resp = await client.post("/webhook/telegram", headers=huge_headers, content=b"")
+        assert huge_resp.status_code == 413
+        assert "Payload Too Large" in huge_resp.text
 
 
 def test_cart_item_search_by_name():

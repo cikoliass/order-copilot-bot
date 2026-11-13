@@ -1,3 +1,4 @@
+import html
 import itertools
 import logging
 from datetime import datetime, timezone
@@ -107,19 +108,24 @@ async def view_orders_journal():
     rows_html = ""
     for ord_data in SAVED_ORDERS:
         items_detail = "<br>".join(
-            f"• <b>[{it['sku_id']}] {it.get('name') or 'Товар'}</b>: "
-            f"<code>{it['qty']:g} {it['unit']}</code> × {it['price']:g} ₽ = <b>{it['qty'] * it['price']:,.2f} ₽</b>"
+            f"• <b>[{html.escape(str(it['sku_id']))}] {html.escape(str(it.get('name') or 'Товар'))}</b>: "
+            f"<code>{it['qty']:g} {html.escape(str(it['unit']))}</code> × {it['price']:g} ₽ = <b>{it['qty'] * it['price']:,.2f} ₽</b>"
             for it in ord_data["items"]
         )
+        safe_doc_num = html.escape(str(ord_data['doc_num']))
+        safe_created_at = html.escape(str(ord_data.get('created_at', '-')))
+        safe_client_id = html.escape(str(ord_data['client_id']))
+        safe_delivery_date = html.escape(str(ord_data['delivery_date']))
+        safe_state = html.escape(str(ord_data['state']))
         rows_html += f"""
         <tr style="border-bottom: 1px solid #334155; transition: background 0.2s;" onmouseover="this.style.background='#1e293b'" onmouseout="this.style.background='transparent'">
-            <td style="padding: 14px; font-weight: 700; color: #38bdf8; font-family: monospace; font-size: 15px;">{ord_data['doc_num']}</td>
-            <td style="padding: 14px; color: #94a3b8; font-size: 13px;">{ord_data.get('created_at', '-')}</td>
-            <td style="padding: 14px; font-weight: 600; color: #f1f5f9;"><span style="background: #334155; padding: 4px 8px; border-radius: 6px;">{ord_data['client_id']}</span></td>
-            <td style="padding: 14px; color: #cbd5e1;">{ord_data['delivery_date']}</td>
+            <td style="padding: 14px; font-weight: 700; color: #38bdf8; font-family: monospace; font-size: 15px;">{safe_doc_num}</td>
+            <td style="padding: 14px; color: #94a3b8; font-size: 13px;">{safe_created_at}</td>
+            <td style="padding: 14px; font-weight: 600; color: #f1f5f9;"><span style="background: #334155; padding: 4px 8px; border-radius: 6px;">{safe_client_id}</span></td>
+            <td style="padding: 14px; color: #cbd5e1;">{safe_delivery_date}</td>
             <td style="padding: 14px; font-size: 13px; line-height: 1.6; color: #e2e8f0;">{items_detail}</td>
             <td style="padding: 14px; font-weight: 700; color: #4ade80; font-size: 16px; white-space: nowrap;">{ord_data['total_amount']:,.2f} ₽</td>
-            <td style="padding: 14px;"><span style="background: #064e3b; color: #6ee7b7; border: 1px solid #059669; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;">{ord_data['state']}</span></td>
+            <td style="padding: 14px;"><span style="background: #064e3b; color: #6ee7b7; border: 1px solid #059669; padding: 4px 10px; border-radius: 6px; font-size: 12px; font-weight: 600;">{safe_state}</span></td>
         </tr>
         """
 

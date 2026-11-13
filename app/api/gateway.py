@@ -6,6 +6,7 @@ import ipaddress
 import json
 import logging
 import re
+import socket
 import time
 import urllib.parse
 from collections import defaultdict
@@ -736,30 +737,82 @@ async def try_handle_cart_edit(
     return False
 
 
+def _is_safe_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Проверка IP на отсутствие в приватных, петлевых, сервисных и зарезервированных диапазонах."""
+    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+        ip_obj = ip_obj.ipv4_mapped
+
+    if (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_reserved
+        or ip_obj.is_multicast
+        or ip_obj.is_unspecified
+    ):
+        return False
+
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        # Carrier-Grade NAT (RFC 6598: 100.64.0.0/10)
+        if ip_obj in ipaddress.IPv4Network("100.64.0.0/10"):
+            return False
+
+    return True
+
+
 def _is_safe_url_for_download(url: str) -> bool:
-    """Защита от SSRF (Server-Side Request Forgery) и запросов к локальным сетям."""
+    """
+    Защита от SSRF (Server-Side Request Forgery) и запросов к локальным/внутренним сетям.
+    Проверяет протокол, порт, отсутствие учетных данных в URL и резолвит DNS-записи,
+    блокируя доступ к приватным, loopback, link-local и reserved IP (включая DNS rebinding).
+    """
     try:
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return False
+
+        if parsed.username or parsed.password:
+            return False
+
         hostname = parsed.hostname
         if not hostname:
             return False
-        if hostname.lower() in ("localhost", "127.0.0.1", "::1"):
+
+        hostname_clean = hostname.strip().lower()
+        if hostname_clean in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
             return False
+
+        if parsed.port and parsed.port not in (80, 443, 8080, 8443):
+            return False
+
+        # Если hostname передан как чистый IP-адрес
         try:
-            ip = ipaddress.ip_address(hostname)
-            if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                return False
+            ip = ipaddress.ip_address(hostname_clean)
+            return _is_safe_ip(ip)
         except ValueError:
             pass
+
+        # Если hostname — доменное имя, резолвим DNS для защиты от DNS rebinding
+        try:
+            addr_info = socket.getaddrinfo(hostname_clean, None)
+            if not addr_info:
+                return False
+            for item in addr_info:
+                sockaddr = item[4]
+                ip_str = sockaddr[0]
+                ip_cand = ipaddress.ip_address(ip_str)
+                if not _is_safe_ip(ip_cand):
+                    return False
+        except (socket.gaierror, socket.herror, ValueError):
+            return False
+
         return True
     except Exception:
         return False
 
 
 async def _download_audio(url: str) -> bytes | None:
-    """Безопасное скачивание аудио с защитой от SSRF и утечки MAX_BOT_TOKEN."""
+    """Безопасное скачивание аудио с защитой от SSRF, открытых редиректов и утечки MAX_BOT_TOKEN."""
     if not _is_safe_url_for_download(url):
         logger.error("Заблокирована попытка SSRF по URL: %s", url)
         return None
@@ -770,12 +823,16 @@ async def _download_audio(url: str) -> bytes | None:
 
         # Токен MAX передается ТОЛЬКО на доверенный домен max.ru, а не на evil.com?max.ru
         headers = {}
-        if settings.MAX_BOT_TOKEN and (hostname == "platform-api2.max.ru" or hostname.endswith(".max.ru")):
+        if settings.MAX_BOT_TOKEN and (hostname == "platform-api2.max.ru" or hostname == "max.ru" or hostname.endswith(".max.ru")):
             headers["Authorization"] = settings.MAX_BOT_TOKEN
 
-        async with httpx.AsyncClient(timeout=25.0) as client:
+        # follow_redirects=False исключает обход SSRF через HTTP 302 редиректы на внутренние адреса
+        async with httpx.AsyncClient(timeout=25.0, follow_redirects=False) as client:
             resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
+                if len(resp.content) > 20 * 1024 * 1024:
+                    logger.error("Скачанный аудиофайл превышает максимальный размер 20 МБ: %s", url)
+                    return None
                 return resp.content
             logger.error("Ошибка скачивания аудио по URL %s: HTTP %d", url, resp.status_code)
     except Exception as exc:
@@ -989,8 +1046,10 @@ async def vk_webhook(request: Request) -> Response:
     """Вебхук ВКонтакте Callback API с валидацией secret и confirmation."""
     data = await request.json()
 
-    if settings.VK_SECRET_KEY and data.get("secret") != settings.VK_SECRET_KEY and data.get("type") != "confirmation":
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid VK secret")
+    if settings.VK_SECRET_KEY and data.get("type") != "confirmation":
+        provided_secret = str(data.get("secret") or "")
+        if not hmac.compare_digest(provided_secret, settings.VK_SECRET_KEY):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid VK secret")
 
     event_type = data.get("type")
     if event_type == "confirmation":
@@ -1177,6 +1236,11 @@ class OrderStatusUpdateRequest(BaseModel):
     comment: str | None = None
 
 
+def _escape_like_wildcards(val: str) -> str:
+    """Экранирует специальные символы SQL LIKE (%, _, \\) для предотвращения wildcard-инъекций."""
+    return val.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 @router.post("/1c/status", tags=["1C API"])
 @router.post("/orders/{doc_num}/status", tags=["1C API"])
 async def update_order_status(
@@ -1184,9 +1248,13 @@ async def update_order_status(
     request: Request,
     doc_num: str | None = None,
 ) -> dict[str, Any]:
-    """Вебхук обновления статуса из 1С с точным поиском номера документа."""
+    """Вебхук обновления статуса из 1С с точным поиском номера документа и экранированием wildcards."""
     verify_webhook_auth(request)
     target_doc = (doc_num or payload.document_number).strip()
+    if not target_doc or len(target_doc) > 128:
+        raise HTTPException(status_code=400, detail="Invalid or excessively long document number")
+
+    safe_target = _escape_like_wildcards(target_doc)
 
     async with async_session_factory() as session:
         # Точный поиск: равенство или точное совпадение токена в составном номере "ЗК-1 / Б24-2"
@@ -1194,9 +1262,9 @@ async def update_order_status(
             select(OrderRecord)
             .where(
                 (OrderRecord.document_number_1c == target_doc)
-                | (OrderRecord.document_number_1c.like(f"{target_doc} / %"))
-                | (OrderRecord.document_number_1c.like(f"% / {target_doc}"))
-                | (OrderRecord.document_number_1c.like(f"% / {target_doc} / %"))
+                | (OrderRecord.document_number_1c.like(f"{safe_target} / %", escape="\\"))
+                | (OrderRecord.document_number_1c.like(f"% / {safe_target}", escape="\\"))
+                | (OrderRecord.document_number_1c.like(f"% / {safe_target} / %", escape="\\"))
             )
             .order_by(OrderRecord.id.desc())
         )
