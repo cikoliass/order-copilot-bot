@@ -99,9 +99,11 @@ def _fallback_rule_based_parser(raw_text: str) -> ExtractedOrder:
 
     items: list[RawItem] = []
     for line in (c.strip() for c in re.split(r"(?:[\n,;]+|\s+(?:и|плюс|а\s+также)\s+)", working_text) if c.strip()):
+        if len(line) > 300:
+            continue
         if delivery_date and delivery_date in line.lower() and len(line) < 25:
             continue
-        if m := re.search(r"(\d+(?:[.,]\d+)?)\s*([a-zA-Zа-яА-ЯёЁ]+)?\s+(.+)", line):
+        if m := re.match(r"^(\d{1,7}(?:[.,]\d{1,3})?)\s*([a-zA-Zа-яА-ЯёЁ]{1,20})?\s+(.+)$", line):
             qty_str, unit_cand, name_cand = m.groups()
             unit = unit_keywords.get((unit_cand or "").lower(), "шт")
             name = name_cand.strip() if unit_cand and unit_cand.lower() in unit_keywords else f"{unit_cand or ''} {name_cand}".strip()
@@ -155,8 +157,12 @@ def _fallback_cart_intent(raw_text: str, cart_items: list[str]) -> CartIntentRes
         target = m_del.group(1).strip()
         if target not in ("все", "всё", "заказ", "весь заказ"):
             return CartIntentResult(action="remove", target_item=target[:255])
-    if any(w in t for w in ("давай", "добавь", "докинь", "плюс", "еще", "ещё", "дополнительно", "докинуть")):
-        clean_text = re.sub(r"\b(?:ну\s+и\s+давай|ну\s+давай|давай|добавь|докинь|плюс|еще|ещё|немного|чуть|чуть-чуть|сверху)\b", " ", t).strip()
+    if not has_negation and re.search(r"\b(?:давай|добавь|докинь|плюс|еще|ещё|дополнительно|докинуть)\b", t):
+        clean_text = re.sub(
+            r"\b(?:ну\s+и\s+давай|ну\s+давай|давай|добавь|докинь|плюс|еще|ещё|немного|чуть|чуть-чуть|сверху)\b",
+            " ",
+            t,
+        ).strip()
         clean_text = re.sub(r"\s+", " ", clean_text)
         if clean_text:
             parsed = _fallback_rule_based_parser(clean_text)

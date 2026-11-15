@@ -651,7 +651,7 @@ async def _apply_cart_add(
 
 
 async def _apply_new_order(
-    session_id: str, platform: str, chat_id: str, order_text: str, items_to_add: list[RawItem], delivery_date: str | None = None
+    session_id: str, platform: str, chat_id: str, order_text: str, items_to_add: list[RawItem], delivery_date: str | None = None, creator_user_id: str | None = None
 ) -> bool:
     if not items_to_add:
         return False
@@ -660,6 +660,7 @@ async def _apply_new_order(
         "raw_text": order_text,
         "delivery_date": delivery_date or "По регламенту",
         "matched_items": [it.model_dump() for it in new_matched],
+        "creator_user_id": creator_user_id,
     }
     prefix = _fmt_msg(platform, "🆕 Предыдущий черновик отменен. Новый заказ:\n\n", "🆕 <i>Предыдущий черновик отменен. Новый заказ:</i>\n\n")
     await _save_and_send_card(session_id, platform, chat_id, new_draft, prefix=prefix)
@@ -672,7 +673,7 @@ async def _handle_cancel_command(session_id: str, platform: str, chat_id: str) -
     await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg))
 
 
-async def _handle_predict_command(session_id: str, platform: str, chat_id: str) -> None:
+async def _handle_predict_command(session_id: str, platform: str, chat_id: str, platform_user_id: str | None = None) -> None:
     ideal_items = await order_predictor.predict_ideal_order(session_id, top_k=6)
     if not ideal_items:
         msg = _fmt_msg(platform, "✨ История заказов пока пуста. Оформите первый заказ, чтобы обучить систему.", "✨ <b>История заказов пока пуста.</b> Оформите первый заказ, чтобы обучить систему.")
@@ -684,6 +685,7 @@ async def _handle_predict_command(session_id: str, platform: str, chat_id: str) 
         "raw_text": "[ИИ: Идеальный заказ]",
         "delivery_date": "Завтра",
         "matched_items": [it.model_dump() for it in ideal_items],
+        "creator_user_id": platform_user_id,
     }
     await _save_and_send_card(session_id, platform, chat_id, draft, prefix=prefix)
 
@@ -708,6 +710,25 @@ async def execute_order_confirmation(
         if not draft or not draft.get("matched_items"):
             await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text="⚠️ <b>Корзина пуста или устарела.</b> Отправьте состав заказа заново."))
             return
+
+        client_1c_id = None
+        try:
+            from app.core.database import get_client_binding
+            binding = await get_client_binding(platform, platform_user_id)
+            creator_uid = draft.get("creator_user_id")
+            if creator_uid and creator_uid != platform_user_id and settings.REQUIRE_CLIENT_AUTH:
+                creator_binding = await get_client_binding(platform, str(creator_uid))
+                if creator_binding and binding and creator_binding.counterparty_1c_id != binding.counterparty_1c_id:
+                    await dispatcher.send(OutboundMessage(
+                        platform=platform,
+                        chat_id=chat_id,
+                        text="⛔ <b>Ошибка доступа:</b> вы не можете подтвердить заказ, созданный сотрудником другого контрагента.",
+                    ))
+                    return
+            if binding and binding.counterparty_1c_id:
+                client_1c_id = binding.counterparty_1c_id
+        except Exception as bind_err:
+            logger.warning("Не удалось получить привязку клиента для 1С: %s", bind_err)
 
         all_items = [MatchedItem.model_validate(it) for it in draft["matched_items"]]
 
@@ -845,15 +866,6 @@ async def execute_order_confirmation(
             status="Отправка в учетные системы",
             document_number_1c=None,
         )
-
-        client_1c_id = None
-        try:
-            from app.core.database import get_client_binding
-            binding = await get_client_binding(platform, platform_user_id)
-            if binding and binding.counterparty_1c_id:
-                client_1c_id = binding.counterparty_1c_id
-        except Exception as bind_err:
-            logger.warning("Не удалось получить привязку клиента для 1С: %s", bind_err)
 
         result = await integrations_service.send_order(
             session_id=session_id,
@@ -1003,7 +1015,7 @@ async def try_handle_cart_edit(
 
     if action == "new_order":
         items_to_add = cart_intent.items_to_add or (await extract_order_from_text(order_text)).items
-        return await _apply_new_order(session_id, platform, chat_id, order_text, items_to_add, cart_intent.delivery_date)
+        return await _apply_new_order(session_id, platform, chat_id, order_text, items_to_add, cart_intent.delivery_date, creator_user_id=platform_user_id)
 
     if action == "swap_analog":
         return await _apply_analog_swap(session_id, platform, chat_id, draft)
@@ -1167,41 +1179,45 @@ async def _download_audio(url: str) -> bytes | None:
 
 
 async def _download_tg_file(file_id: str) -> bytes | None:
-    if not file_id or not re.match(r"^[A-Za-z0-9_\-]+$", str(file_id)):
+    if not file_id or len(file_id) > 256 or not re.match(r"^[A-Za-z0-9_\-]+$", str(file_id)):
         logger.warning("Отклонен некорректный file_id Telegram: %s", file_id)
         return None
+    token = settings.TELEGRAM_BOT_TOKEN
+    if not token:
+        return None
     try:
-        token = settings.TELEGRAM_BOT_TOKEN
-        if not token:
-            return None
-        async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=15.0) as client:
-            res = await client.get(
-                f"https://api.telegram.org/bot{token}/getFile",
-                params={"file_id": file_id},
-            )
-            if res.status_code == 200 and (fp := res.json().get("result", {}).get("file_path")):
-                fp_clean = str(fp).strip().replace("\\", "/")
-                if ".." in fp_clean or fp_clean.startswith(("/", "./")) or "//" in fp_clean or not re.match(r"^[a-zA-Z0-9_\-\./]+$", fp_clean):
-                    logger.warning("Отклонен небезопасный file_path Telegram: %s", fp_clean)
-                    return None
-
-                max_bytes = 20 * 1024 * 1024
-                async with client.stream("GET", f"https://api.telegram.org/file/bot{token}/{fp_clean}") as dl_resp:
-                    if dl_resp.status_code != 200:
+        async with asyncio.timeout(25.0):
+            async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=10.0) as client:
+                res = await client.get(
+                    f"https://api.telegram.org/bot{token}/getFile",
+                    params={"file_id": file_id},
+                )
+                if res.status_code == 200 and (fp := res.json().get("result", {}).get("file_path")):
+                    fp_clean = str(fp).strip().replace("\\", "/")
+                    if (
+                        ".." in fp_clean
+                        or fp_clean.startswith(("/", "./"))
+                        or "//" in fp_clean
+                        or not re.match(r"^[a-zA-Z0-9_\-\./]+$", fp_clean)
+                    ):
+                        logger.warning("Отклонен небезопасный file_path Telegram: %s", fp_clean)
                         return None
-                    chunks = []
-                    total_bytes = 0
-                    async for chunk in dl_resp.aiter_bytes(chunk_size=65536):
-                        total_bytes += len(chunk)
-                        if total_bytes > max_bytes:
-                            logger.error("Аудиофайл Telegram превышает лимит 20 МБ")
+
+                    max_bytes = 20 * 1024 * 1024
+                    async with client.stream("GET", f"https://api.telegram.org/file/bot{token}/{fp_clean}") as dl_resp:
+                        if dl_resp.status_code != 200:
                             return None
-                        chunks.append(chunk)
-                    return b"".join(chunks)
+                        chunks = []
+                        total_bytes = 0
+                        async for chunk in dl_resp.aiter_bytes(chunk_size=65536):
+                            total_bytes += len(chunk)
+                            if total_bytes > max_bytes:
+                                logger.error("Аудиофайл Telegram превышает лимит 20 МБ")
+                                return None
+                            chunks.append(chunk)
+                        return b"".join(chunks)
     except Exception as exc:
-        safe_err = str(exc)
-        if token:
-            safe_err = safe_err.replace(token, "***")
+        safe_err = str(exc).replace(token, "***")
         safe_err = re.sub(r"bot[0-9]+:[A-Za-z0-9_\-]+", "bot***:***", safe_err)
         logger.warning("Не удалось скачать аудиофайл Telegram: %s", safe_err)
     return None
@@ -1264,7 +1280,7 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
                 await _handle_cancel_command(session_id, platform, chat_id)
                 return
             if action == "copilot:predict":
-                await _handle_predict_command(session_id, platform, chat_id)
+                await _handle_predict_command(session_id, platform, chat_id, inbound.platform_user_id)
                 return
             if action.startswith("copilot:del:"):
                 try:
@@ -1314,7 +1330,11 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
                 except Exception as exc:
                     logger.warning("Ошибка обработки copilot:round: %s", exc)
 
-        voice_bytes = inbound.voice_bytes or (await _download_audio(inbound.voice_url) if inbound.voice_url else None)
+        voice_bytes = (
+            inbound.voice_bytes
+            or (await _download_tg_file(inbound.voice_file_id) if inbound.voice_file_id else None)
+            or (await _download_audio(inbound.voice_url) if inbound.voice_url else None)
+        )
         recognized_text: str | None = None
         if voice_bytes:
             try:
@@ -1455,6 +1475,7 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
             "delivery_date": eff_delivery_date,
             "matched_items": [it.model_dump() for it in matched_items],
             "recognized_speech": recognized_text,
+            "creator_user_id": (draft.get("creator_user_id") if draft else None) or inbound.platform_user_id,
         }
         prefix = _fmt_msg(platform, "➕ Добавлено к текущему заказу:\n\n", "➕ <i>Добавлено к текущему заказу:</i>\n\n") if is_appended else ""
         await _save_and_send_card(session_id, platform, chat_id, new_draft, prefix=prefix, missing_hints=missing_items)
@@ -1524,12 +1545,15 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
             chat_obj = msg.get("chat")
             chat_id = str(chat_obj.get("id", u_id)) if isinstance(chat_obj, dict) else u_id
             voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
-            file_id = voice.get("file_id") if isinstance(voice, dict) else None
-            voice_bytes = await _download_tg_file(file_id) if file_id and settings.TELEGRAM_BOT_TOKEN else None
+            file_id = str(voice.get("file_id"))[:256] if isinstance(voice, dict) and voice.get("file_id") else None
             text = msg.get("text") or msg.get("caption")
             if u_id:
                 inbound = InboundMessage(
-                    platform="telegram", platform_user_id=u_id, chat_id=chat_id, text=text, voice_bytes=voice_bytes
+                    platform="telegram",
+                    platform_user_id=u_id,
+                    chat_id=chat_id,
+                    text=text,
+                    voice_file_id=file_id,
                 )
 
     if inbound:
@@ -1846,9 +1870,9 @@ async def max_webhook(request: Request) -> dict[str, str]:
 # ВЕБХУКИ 1C И БИТРИКС24 С АВТОРИЗАЦИЕЙ И ТОЧНЫМ ПОИСКОМ
 # =========================================================================
 class OrderStatusUpdateRequest(BaseModel):
-    document_number: str
-    status: str
-    comment: str | None = None
+    document_number: str = Field(..., min_length=1, max_length=128)
+    status: str = Field(..., min_length=1, max_length=255)
+    comment: str | None = Field(default=None, max_length=1000)
 
 
 def _escape_like_wildcards(val: str) -> str:
@@ -1863,11 +1887,11 @@ async def update_order_status(
     request: Request,
     doc_num: str | None = None,
 ) -> dict[str, Any]:
-    """Вебхук обновления статуса из 1С с точным поиском номера документа и экранированием wildcards."""
+    """Вебхук обновления статуса из 1С с точным поиском номера документа и валидацией формата."""
     verify_webhook_auth(request)
     target_doc = (doc_num or payload.document_number).strip()
-    if not target_doc or len(target_doc) > 128:
-        raise HTTPException(status_code=400, detail="Invalid or excessively long document number")
+    if not target_doc or len(target_doc) > 128 or not re.match(r"^[A-Za-zА-Яа-яЁё0-9_\-]+$", target_doc):
+        raise HTTPException(status_code=400, detail="Invalid document number format")
 
     safe_target = _escape_like_wildcards(target_doc)
 
@@ -1915,23 +1939,32 @@ async def update_order_status(
 @router.post("/bitrix/product-sync", tags=["Catalog"])
 @router.get("/catalog/sync", tags=["Catalog"])
 async def bitrix_catalog_webhook(request: Request) -> dict[str, Any]:
-    """Вебхук синхронизации каталога из Битрикс24 (с защитой от стирания каталога)."""
+    """Вебхук синхронизации каталога из Битрикс24 с защитой от параллельного шторма запросов."""
     verify_webhook_auth(request)
-    synced = await sync_catalog_from_bitrix()
-    if synced:
-        catalog_matcher.reload(synced)
+    sync_lock_key = "catalog_sync_cooldown"
+    lock_token = str(uuid.uuid4())
+    if not await redis_client.acquire_lock(sync_lock_key, timeout=15, lock_token=lock_token):
         return {
-            "status": "ok",
-            "items_count": len(synced),
-            "message": f"Каталог успешно синхронизирован: {len(synced)} позиций в памяти.",
+            "status": "skipped",
+            "items_count": len(catalog_matcher.catalog),
+            "message": "Синхронизация каталога уже выполняется.",
         }
-    else:
-        # Не вызываем reload([])! Каталог сохраняется.
+    try:
+        synced = await sync_catalog_from_bitrix()
+        if synced:
+            catalog_matcher.reload(synced)
+            return {
+                "status": "ok",
+                "items_count": len(synced),
+                "message": f"Каталог успешно синхронизирован: {len(synced)} позиций в памяти.",
+            }
         return {
             "status": "warning",
             "items_count": len(catalog_matcher.catalog),
             "message": "Битрикс24 вернул пустой список товаров или недоступен. Локальный каталог не изменен.",
         }
+    finally:
+        await redis_client.release_lock(sync_lock_key, lock_token=lock_token)
 
 
 class OneCStockUpdate(BaseModel):

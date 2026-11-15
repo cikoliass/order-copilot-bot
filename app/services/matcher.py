@@ -146,7 +146,14 @@ class CatalogMatcher:
 
     def reload(self, raw_items: Optional[list[dict[str, Any]]] = None) -> None:
         """Потокобезопасная перезагрузка каталога напрямую из списка товаров Битрикс24 (хранение в RAM)."""
-        new_catalog = [CatalogSKU.from_raw(it) for it in raw_items] if raw_items is not None else []
+        new_catalog: list[CatalogSKU] = []
+        if raw_items is not None:
+            for it in raw_items:
+                try:
+                    if isinstance(it, dict):
+                        new_catalog.append(CatalogSKU.from_raw(it))
+                except Exception as exc:
+                    logger.warning("Пропущен некорректный элемент каталога: %s", exc)
 
         # Построение быстрого индекса точных совпадений в локальных структурах (без блокировки читателей)
         new_exact_index: dict[str, CatalogSKU] = {}

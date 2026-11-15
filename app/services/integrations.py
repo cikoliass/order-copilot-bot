@@ -81,6 +81,13 @@ class IntegrationResult(BaseModel):
     details: str | None = None
 
 
+class BitrixProductRowsError(RuntimeError):
+    """Исключение при сбое привязки товаров к уже созданной сделке Битрикс24."""
+    def __init__(self, deal_id: int, message: str):
+        super().__init__(message)
+        self.deal_id = deal_id
+
+
 class IntegrationsService:
     """Сервис отправки заказов в 1С и CRM Битрикс24 с транзакционным Outbox-фоллбэком."""
 
@@ -171,12 +178,17 @@ class IntegrationsService:
 
             if product_rows:
                 rows_url = f"{webhook_url.rstrip('/')}/crm.deal.productrows.set.json"
-                rows_resp = await asyncio.wait_for(
-                    client.post(rows_url, json={"id": deal_id, "rows": product_rows}),
-                    timeout=settings.BITRIX_TIMEOUT_SEC,
-                )
-                if rows_resp.status_code not in (200, 201) or "error" in rows_resp.json():
-                    raise RuntimeError(f"Ошибка привязки товаров к сделке Б24-{deal_id}: {rows_resp.text}")
+                try:
+                    rows_resp = await asyncio.wait_for(
+                        client.post(rows_url, json={"id": deal_id, "rows": product_rows}),
+                        timeout=settings.BITRIX_TIMEOUT_SEC,
+                    )
+                    if rows_resp.status_code not in (200, 201) or "error" in rows_resp.json():
+                        raise BitrixProductRowsError(int(deal_id), f"Ошибка привязки товаров к сделке Б24-{deal_id}: {rows_resp.text}")
+                except BitrixProductRowsError:
+                    raise
+                except Exception as exc:
+                    raise BitrixProductRowsError(int(deal_id), f"Сбой привязки товаров к сделке Б24-{deal_id}: {exc}") from exc
 
             return f"Б24-{deal_id}"
 
@@ -201,11 +213,27 @@ class IntegrationsService:
                 logger.warning("Сбой отправки заказа в 1С: %s", sanitized_err)
                 errors.append(f"1C: {sanitized_err}")
 
-        if not any("Б24-" in str(d) for d in docs):
+        has_completed_b24 = any(str(d).startswith("Б24-") and not str(d).startswith("Б24-PENDING-") for d in docs)
+        if not has_completed_b24:
+            pending_deal_id: int | None = None
+            for d in list(docs):
+                if str(d).startswith("Б24-PENDING-"):
+                    raw_id = str(d).replace("Б24-PENDING-", "").strip()
+                    if raw_id.isdigit():
+                        pending_deal_id = int(raw_id)
+                        docs.remove(d)
+                    break
             try:
-                doc_b24 = await self._send_to_bitrix24(client_id, items, delivery_date, total_amount)
+                doc_b24 = await self._send_to_bitrix24(
+                    client_id, items, delivery_date, total_amount, existing_deal_id=pending_deal_id
+                )
                 if doc_b24 != "Б24-DISABLED":
                     docs.append(doc_b24)
+            except BitrixProductRowsError as b24_row_err:
+                docs.append(f"Б24-PENDING-{b24_row_err.deal_id}")
+                sanitized_err = _sanitize_error_msg(b24_row_err)
+                logger.warning("Сделка Б24-%d создана, но товары не привязаны: %s", b24_row_err.deal_id, sanitized_err)
+                errors.append(f"Битрикс24: {sanitized_err}")
             except Exception as exc:
                 sanitized_err = _sanitize_error_msg(exc)
                 logger.warning("Сбой отправки заказа в Битрикс24: %s", sanitized_err)

@@ -47,13 +47,35 @@ class CatalogSKU(BaseModel):
 
     @classmethod
     def from_raw(cls, data: dict[str, Any]) -> "CatalogSKU":
+        import math
         import re
         sku_id = data.get("sku_id") or data.get("sku") or "SKU-000"
         name = data.get("name") or data.get("catalog_name") or "Товар"
         base_unit = data.get("base_unit") or "шт"
-        price = float(data.get("price") or 0.0)
-        stock_quantity = float(data.get("stock_quantity") if data.get("stock_quantity") is not None else 999.0)
+
+        try:
+            price = float(data.get("price") or 0.0)
+            if math.isnan(price) or math.isinf(price) or price < 0:
+                price = 0.0
+        except (ValueError, TypeError):
+            price = 0.0
+
+        try:
+            stock_quantity = float(data.get("stock_quantity") if data.get("stock_quantity") is not None else 999.0)
+            if math.isnan(stock_quantity) or math.isinf(stock_quantity) or stock_quantity < 0:
+                stock_quantity = 0.0
+        except (ValueError, TypeError):
+            stock_quantity = 999.0
+
         pack_multiple = data.get("pack_multiple")
+        try:
+            if pack_multiple is not None:
+                pack_multiple = float(pack_multiple)
+                if math.isnan(pack_multiple) or math.isinf(pack_multiple) or pack_multiple <= 0:
+                    pack_multiple = None
+        except (ValueError, TypeError):
+            pack_multiple = None
+
         analogs = data.get("analogs") or []
         aliases = data.get("aliases") or []
         rates = data.get("conversion_rates") or data.get("unit_conversions") or {}
@@ -67,6 +89,16 @@ class CatalogSKU(BaseModel):
                 except Exception:
                     pass
 
+        safe_rates: dict[str, float] = {}
+        if isinstance(rates, dict):
+            for k, v in rates.items():
+                try:
+                    fv = float(v)
+                    if fv > 0 and not math.isnan(fv) and not math.isinf(fv):
+                        safe_rates[str(k).lower().strip()] = fv
+                except (ValueError, TypeError):
+                    continue
+
         return cls(
             sku_id=str(sku_id),
             name=name,
@@ -76,7 +108,7 @@ class CatalogSKU(BaseModel):
             pack_multiple=pack_multiple,
             analogs=[str(a) for a in analogs if a],
             aliases=[str(a).lower().strip() for a in aliases if a],
-            conversion_rates={k.lower().strip(): float(v) for k, v in rates.items()},
+            conversion_rates=safe_rates,
         )
 
 
@@ -137,6 +169,7 @@ class InboundMessage(BaseModel):
     text: Optional[str] = None
     voice_bytes: Optional[bytes] = None
     voice_url: Optional[str] = None
+    voice_file_id: Optional[str] = Field(default=None, max_length=256)
     callback_data: Optional[str] = Field(default=None, max_length=256)
     message_id: Optional[str] = None
 

@@ -7,7 +7,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.gateway import process_inbound_core, router as gateway_router
+from app.api.gateway import _is_duplicate_update_async, process_inbound_core, router as gateway_router
 from app.core.config import settings
 from app.core.database import engine, get_pending_outbox_entries, init_db
 from app.core.redis_client import redis_client
@@ -75,6 +75,9 @@ async def _run_vk_polling_bridge(token: str) -> None:
                         ev_type, obj = update.get("type"), update.get("object", {})
                         if ev_type == "message_new":
                             msg = obj.get("message", {})
+                            msg_id = msg.get("id") or msg.get("conversation_message_id")
+                            if msg_id and await _is_duplicate_update_async(f"vk:{msg_id}"):
+                                continue
                             uid = str(msg.get("from_id", ""))
                             voice_url = next(
                                 (att.get(att.get("type"), {}).get("link_ogg") or att.get(att.get("type"), {}).get("url")
@@ -87,7 +90,10 @@ async def _run_vk_polling_bridge(token: str) -> None:
                         elif ev_type == "message_event":
                             uid = str(obj.get("user_id", ""))
                             peer_id = str(obj.get("peer_id", uid))
-                            if ev_id := obj.get("event_id"):
+                            ev_id = obj.get("event_id")
+                            if ev_id and await _is_duplicate_update_async(f"vk_ev:{uid}:{ev_id}"):
+                                continue
+                            if ev_id:
                                 try:
                                     await client.post(
                                         "https://api.vk.com/method/messages.sendMessageEventAnswer",
@@ -209,6 +215,15 @@ async def _run_whatsapp_polling_bridge(instance_id: str, token: str) -> None:
                         if isinstance(item, dict) and "receiptId" in item:
                             receipt_id = item["receiptId"]
                             data = item.get("body", {})
+                            msg_id = data.get("idMessage") or receipt_id
+                            if msg_id and await _is_duplicate_update_async(f"wa:{msg_id}"):
+                                try:
+                                    await client.delete(f"{url_del}/{receipt_id}")
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(0.1)
+                                continue
+
                             if data.get("typeWebhook") == "incomingMessageReceived":
                                 msg_data = data.get("messageData", {})
                                 sender_data = data.get("senderData", {})
@@ -282,6 +297,15 @@ async def _run_max_polling_bridge(token: str) -> None:
                         data = resp.json()
                         marker = data.get("marker", marker)
                         for upd in data.get("updates", []):
+                            update_key = (
+                                upd.get("update_id")
+                                or upd.get("callback", {}).get("callback_id")
+                                or upd.get("message", {}).get("body", {}).get("message_id")
+                                or upd.get("message", {}).get("message_id")
+                            )
+                            if update_key and await _is_duplicate_update_async(f"max:{update_key}"):
+                                continue
+
                             u_type = upd.get("update_type")
                             if u_type == "bot_started":
                                 uid = str(upd.get("user", {}).get("user_id") or upd.get("chat_id") or "")
@@ -360,17 +384,22 @@ async def lifespan(app: FastAPI):
     if settings.TELEGRAM_BOT_TOKEN:
         if settings.TELEGRAM_WEBHOOK_URL:
             try:
-                secret_param = f"&secret_token={settings.WEBHOOK_SECRET}" if settings.WEBHOOK_SECRET else ""
+                wh_payload: dict[str, Any] = {"url": settings.TELEGRAM_WEBHOOK_URL}
+                if settings.WEBHOOK_SECRET:
+                    wh_payload["secret_token"] = settings.WEBHOOK_SECRET
                 async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=10.0) as client:
-                    res = await client.get(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/setWebhook?url={settings.TELEGRAM_WEBHOOK_URL}{secret_param}")
+                    res = await client.post(
+                        f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/setWebhook",
+                        json=wh_payload,
+                    )
                     res_data = res.json()
-                    # Логируем без URL и токена для предотвращения утечки секретов
                     logger.info("Telegram Webhook установлен: ok=%s, description=%s", res_data.get("ok"), res_data.get("description", ""))
             except Exception as exc:
-                # Редактируем токены из сообщения об ошибке
                 safe_err = str(exc)
                 if settings.TELEGRAM_BOT_TOKEN:
                     safe_err = safe_err.replace(settings.TELEGRAM_BOT_TOKEN, "***BOT_TOKEN***")
+                if settings.WEBHOOK_SECRET:
+                    safe_err = safe_err.replace(settings.WEBHOOK_SECRET, "***WEBHOOK_SECRET***")
                 logger.warning("Не удалось автоматически установить Telegram Webhook: %s", safe_err)
         elif settings.ENABLE_POLLING_BRIDGES:
             _tg_task = asyncio.create_task(_run_telegram_polling_bridge(settings.TELEGRAM_BOT_TOKEN))

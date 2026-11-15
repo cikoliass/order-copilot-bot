@@ -150,16 +150,17 @@ class RedisClient:
 
         now = time.time()
         self._in_memory_fallback[key] = (serialized, now + ttl)
-        # Очистка устаревших черновиков для защиты от OOM/DoS
+        # Очистка устаревших черновиков для защиты от OOM/DoS (безопасное вытеснение ТОЛЬКО черновиков)
         if len(self._in_memory_fallback) > 5000:
-            expired_keys = [
+            expired_drafts = [
                 k for k, v in self._in_memory_fallback.items()
-                if isinstance(v, tuple) and len(v) == 2 and isinstance(v[1], (int, float)) and v[1] < now
+                if k.startswith("order:draft:") and isinstance(v, tuple) and len(v) == 2 and v[1] < now
             ]
-            for ek in expired_keys[:1000]:
+            for ek in expired_drafts[:1000]:
                 self._in_memory_fallback.pop(ek, None)
             if len(self._in_memory_fallback) > 5000:
-                for old_k in list(self._in_memory_fallback.keys())[:500]:
+                draft_keys = [k for k in self._in_memory_fallback.keys() if k.startswith("order:draft:")]
+                for old_k in draft_keys[:500]:
                     self._in_memory_fallback.pop(old_k, None)
 
     async def get_order_draft(self, session_id: str) -> Optional[dict]:

@@ -38,7 +38,7 @@ class OrderPredictor:
                 if not sku:
                     continue
                 try:
-                    raw_q = it.get("final_quantity") if it.get("final_quantity") is not None else it.get("qty")
+                    raw_q = it.get("final_quantity") if it.get("final_quantity") is not None else (it.get("qty") if it.get("qty") is not None else it.get("quantity"))
                     qty = float(raw_q) if raw_q is not None else 1.0
                     if qty <= 0 or math.isnan(qty) or math.isinf(qty):
                         qty = 1.0
@@ -73,10 +73,16 @@ class OrderPredictor:
         cat_map = {item.sku_id: item for item in catalog_matcher.catalog}
         result: list[MatchedItem] = []
 
-        for sku, info in ranked[:top_k]:
+        for sku, info in ranked:
+            if len(result) >= top_k:
+                break
             cat_item = cat_map.get(sku)
+            # Если каталог загружен, но товар выведен из ассортимента или имеет нулевую цену — пропускаем
+            if catalog_matcher.catalog and (not cat_item or cat_item.price <= 0):
+                continue
+
             sample = info["last_item"]
-            opt_qty = round(median(info["quantities"]), 2)
+            opt_qty = min(50000.0, max(1.0, round(median(info["quantities"]), 2)))
 
             is_out_of_stock = False
             suggested_analog_sku = None
@@ -105,11 +111,14 @@ class OrderPredictor:
                         suggested_analog_name = analog.name
                         suggested_analog_price = analog.price
                         suggested_analog_unit = analog.base_unit
-                elif pack_multiple and pack_multiple > 0 and pack_multiple != 1.0:
-                    ratio = opt_qty / pack_multiple
-                    if not math.isclose(ratio, round(ratio), rel_tol=1e-5, abs_tol=1e-5):
-                        suggested_pack_quantity = float(math.ceil(round(ratio, 6)) * pack_multiple)
-                        pack_warning = f"Кратность: {pack_multiple:g} {unit}"
+                else:
+                    if opt_qty > stock:
+                        opt_qty = stock
+                    if pack_multiple and pack_multiple > 0 and pack_multiple != 1.0:
+                        ratio = opt_qty / pack_multiple
+                        if not math.isclose(ratio, round(ratio), rel_tol=1e-5, abs_tol=1e-5):
+                            suggested_pack_quantity = float(math.ceil(round(ratio, 6)) * pack_multiple)
+                            pack_warning = f"Кратность: {pack_multiple:g} {unit}"
             else:
                 price = float(sample.get("price") or 0.0)
                 unit = sample.get("base_unit") or sample.get("unit") or "шт"
