@@ -12,3 +12,4 @@ orders_enterprise.db
 .idea/
 .pytest_cache/
 *.log
+*.zip
