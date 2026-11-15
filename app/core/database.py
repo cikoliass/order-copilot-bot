@@ -2,19 +2,34 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
-from sqlalchemy import DateTime, Float, Integer, String, Text, select, text
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-engine = create_async_engine(settings.DATABASE_URL, echo=False)
+connect_args = {"timeout": 30} if "sqlite" in settings.DATABASE_URL else {}
+engine = create_async_engine(settings.DATABASE_URL, echo=False, connect_args=connect_args)
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
 class Base(DeclarativeBase):
     pass
+
+
+class ClientBinding(Base):
+    """Справочник авторизованных контрагентов HoReCa (привязка мессенджера к ИНН и карточке 1С)."""
+    __tablename__ = "client_bindings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    platform: Mapped[str] = mapped_column(String(32), index=True)
+    platform_user_id: Mapped[str] = mapped_column(String(128), index=True)
+    counterparty_name: Mapped[str] = mapped_column(String(255), default="")
+    inn: Mapped[str] = mapped_column(String(12), index=True, default="")
+    counterparty_1c_id: Mapped[str] = mapped_column(String(64), default="")
+    b24_company_id: Mapped[int] = mapped_column(Integer, default=0)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class OrderRecord(Base):
@@ -84,10 +99,24 @@ async def init_db() -> None:
                         sync_conn.execute(text("ALTER TABLE orders ADD COLUMN platform VARCHAR(32) DEFAULT 'telegram'"))
                     if "platform_user_id" not in existing_columns:
                         sync_conn.execute(text("ALTER TABLE orders ADD COLUMN platform_user_id VARCHAR(128) DEFAULT ''"))
+                    if "telegram_user_id" not in existing_columns:
+                        sync_conn.execute(text("ALTER TABLE orders ADD COLUMN telegram_user_id VARCHAR(64) DEFAULT NULL"))
                     if "total_amount" not in existing_columns:
                         sync_conn.execute(text("ALTER TABLE orders ADD COLUMN total_amount FLOAT DEFAULT 0.0"))
 
         await conn.run_sync(_migrate_sqlite_schema)
+
+
+async def get_client_binding(platform: str, platform_user_id: str) -> Optional[ClientBinding]:
+    """Поиск привязки B2B-контрагента по платформе и ID пользователя."""
+    async with async_session_factory() as session:
+        stmt = select(ClientBinding).where(
+            ClientBinding.platform == platform,
+            ClientBinding.platform_user_id == str(platform_user_id),
+            ClientBinding.is_active == True,
+        )
+        result = await session.execute(stmt)
+        return result.scalars().first()
 
 
 async def save_order(
@@ -107,8 +136,9 @@ async def save_order(
             session_id=session_id,
             platform=platform,
             platform_user_id=platform_user_id,
-            telegram_user_id=platform_user_id,
-            raw_text=raw_text,
+            # Сохраняем telegram_user_id СТРОГО для платформы telegram, избегая загрязнения схемы чужими ID
+            telegram_user_id=platform_user_id if platform == "telegram" else None,
+            raw_text=raw_text or "",
             delivery_date=delivery_date,
             items_json=json.dumps(items_data, ensure_ascii=False),
             total_amount=total_amount,
@@ -153,7 +183,10 @@ async def get_pending_outbox_entries(limit: int = 50) -> list[OrderOutbox]:
         stmt = (
             select(OrderOutbox)
             .where(
-                OrderOutbox.status.in_(["PENDING", "FAILED"]),
+                (
+                    OrderOutbox.status.in_(["PENDING", "FAILED"])
+                    | (OrderOutbox.status == "PROCESSING")
+                ),
                 OrderOutbox.retry_count < OrderOutbox.max_retries,
                 OrderOutbox.next_retry_at <= now,
             )
@@ -162,6 +195,40 @@ async def get_pending_outbox_entries(limit: int = 50) -> list[OrderOutbox]:
         )
         result = await session.execute(stmt)
         return list(result.scalars().all())
+
+
+async def claim_outbox_entries(limit: int = 20) -> list[OrderOutbox]:
+    """
+    Атомарный захват задач Outbox с переводом в статус PROCESSING для исключения дублирования между воркерами.
+    Устанавливает таймаут аренды (lease timeout) на 5 минут в next_retry_at на случай сбоя или перезапуска воркера.
+    """
+    now = datetime.now(timezone.utc)
+    lease_until = datetime.fromtimestamp(now.timestamp() + 300, tz=timezone.utc)
+    async with async_session_factory() as session:
+        stmt = (
+            select(OrderOutbox)
+            .where(
+                (
+                    OrderOutbox.status.in_(["PENDING", "FAILED"])
+                    | (OrderOutbox.status == "PROCESSING")
+                ),
+                OrderOutbox.retry_count < OrderOutbox.max_retries,
+                OrderOutbox.next_retry_at <= now,
+            )
+            .order_by(OrderOutbox.id.asc())
+            .limit(limit)
+        )
+        result = await session.execute(stmt)
+        entries = list(result.scalars().all())
+        if entries:
+            for entry in entries:
+                entry.status = "PROCESSING"
+                entry.next_retry_at = lease_until
+                entry.updated_at = now
+            await session.commit()
+            for entry in entries:
+                await session.refresh(entry)
+        return entries
 
 
 async def mark_outbox_success(entry_id: int) -> None:

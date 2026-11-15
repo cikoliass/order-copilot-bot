@@ -53,6 +53,16 @@ def get_telegram_bot() -> Any:
     return _tg_bot
 
 
+async def close_dispatcher_sessions() -> None:
+    """Безопасное закрытие HTTP-сессий диспетчера при остановке приложения."""
+    global _tg_bot
+    if _tg_bot and hasattr(_tg_bot, "session") and _tg_bot.session:
+        try:
+            await _tg_bot.session.close()
+        except Exception as exc:
+            logger.warning("Ошибка закрытия сессии Telegram Bot: %s", exc)
+
+
 class OmnichannelDispatcher:
     """Универсальный диспетчер исходящих сообщений во все поддерживаемые мессенджеры."""
 
@@ -115,10 +125,15 @@ class OmnichannelDispatcher:
             logger.warning("VK_GROUP_TOKEN не задан. Сообщение не отправлено в VK.")
             return False
 
+        chat_id_str = str(msg.chat_id).strip()
+        if not chat_id_str.lstrip("-").isdigit():
+            logger.error("Некорректный peer_id для VK (не число): %s", msg.chat_id)
+            return False
+
         payload: dict[str, Any] = {
             "access_token": token,
             "v": "5.199",
-            "peer_id": int(msg.chat_id),
+            "peer_id": int(chat_id_str),
             "random_id": int(time.time() * 1000) % 2147483647,
             "message": clean_text_for_vk(msg.text),
         }
@@ -151,7 +166,8 @@ class OmnichannelDispatcher:
             return False
 
         host = f"https://{inst_id[:4]}.api.greenapi.com" if len(inst_id) >= 4 else "https://api.green-api.com"
-        chat_id = msg.chat_id if msg.chat_id.endswith(("@c.us", "@g.us")) else f"{msg.chat_id}@c.us"
+        clean_cid = str(msg.chat_id).lstrip("+").strip()
+        chat_id = clean_cid if clean_cid.endswith(("@c.us", "@g.us")) else f"{clean_cid}@c.us"
         plain_text = html_to_plain_text(msg.text)
 
         flat_buttons = []
@@ -244,8 +260,9 @@ class OmnichannelDispatcher:
             payload["attachments"] = [{"type": "inline_keyboard", "payload": {"buttons": max_btns}}]
 
         async with httpx.AsyncClient(timeout=10.0) as client:
-            for param in (f"chat_id={msg.chat_id}", f"user_id={msg.chat_id}"):
-                resp = await client.post(f"{base_url}/messages?{param}", json=payload, headers=headers)
+            cid = str(msg.chat_id).strip()
+            for query_params in ({"chat_id": cid}, {"user_id": cid}):
+                resp = await client.post(f"{base_url}/messages", params=query_params, json=payload, headers=headers)
                 if resp.status_code in (200, 201):
                     return True
                 if resp.status_code not in (400, 404):

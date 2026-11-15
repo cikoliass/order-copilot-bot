@@ -5,15 +5,17 @@ import html
 import ipaddress
 import json
 import logging
+import math
 import re
 import socket
 import time
 import urllib.parse
+import uuid
 from collections import defaultdict
 from typing import Any, Optional
 import httpx
 from fastapi import APIRouter, Header, HTTPException, Request, Response, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from rapidfuzz import fuzz
 from app.core.config import settings
 from app.core.database import OrderRecord, async_session_factory, save_order
@@ -32,15 +34,66 @@ from app.services.schemas import (
     OutboundButton,
     OutboundMessage,
     RawItem,
+    extract_chat_id_from_session,
 )
 from sqlalchemy import select
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 
-# Очередь блокировок на уровне сессии для защиты от гонок сообщений
-_session_locks: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-_processed_updates: dict[str, float] = {}
+# Менеджер распределенных блокировок сессий с защитой от утечек памяти (bounded cache)
+class SessionLockManager:
+    """Ограниченный пул блокировок сессий с LRU-вытеснением, предотвращающий рост памяти."""
+    def __init__(self, maxsize: int = 5000):
+        from collections import OrderedDict
+        self._locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+        self._maxsize = maxsize
+
+    def get_lock(self, session_id: str) -> asyncio.Lock:
+        if session_id in self._locks:
+            self._locks.move_to_end(session_id)
+            return self._locks[session_id]
+
+        if len(self._locks) >= self._maxsize:
+            # Ищем и удаляем разблокированные устаревшие блокировки с начала
+            for k in list(self._locks.keys())[:100]:
+                if not self._locks[k].locked():
+                    del self._locks[k]
+                    if len(self._locks) < self._maxsize:
+                        break
+        lock = asyncio.Lock()
+        self._locks[session_id] = lock
+        return lock
+
+    def __getitem__(self, session_id: str) -> asyncio.Lock:
+        return self.get_lock(session_id)
+
+
+class BoundedTTLSet:
+    """Кольцевой кэш дедупликации входящих обновлений со временем жизни TTL и фиксированной памятью."""
+    def __init__(self, maxsize: int = 15000, ttl_sec: float = 300.0):
+        from collections import OrderedDict
+        self._maxsize = maxsize
+        self._ttl_sec = ttl_sec
+        self._items: OrderedDict[str, float] = OrderedDict()
+
+    def is_duplicate_and_add(self, key: str) -> bool:
+        now = time.time()
+        while self._items and next(iter(self._items.values())) < now:
+            self._items.popitem(last=False)
+
+        if key in self._items:
+            return True
+
+        if len(self._items) >= self._maxsize:
+            self._items.popitem(last=False)
+
+        self._items[key] = now + self._ttl_sec
+        return False
+
+
+_session_locks = SessionLockManager(maxsize=5000)
+_update_deduplicator = BoundedTTLSet(maxsize=15000, ttl_sec=300.0)
 
 DIRECT_CONFIRM_PHRASES = {
     "1", "да", "ок", "ok", "yes", "беру", "берем", "подтверждаю", "подтвердить",
@@ -71,30 +124,33 @@ def _fmt_msg(platform: str, plain: str, html_text: str) -> str:
 
 
 def _is_duplicate_update(update_key: str) -> bool:
-    """Дедупликация входящих вебхук-апдейтов."""
-    now = time.time()
-    to_del = [k for k, exp in _processed_updates.items() if now > exp]
-    for k in to_del:
-        _processed_updates.pop(k, None)
-
-    if update_key in _processed_updates:
-        return True
-    _processed_updates[update_key] = now + 300.0
-    return False
+    """Дедупликация входящих вебхук-апдейтов через кольцевой буфер с O(1) добавлением."""
+    return _update_deduplicator.is_duplicate_and_add(update_key)
 
 
 def verify_webhook_auth(
     request: Request,
     secret_header_name: Optional[str] = None,
-    allow_query: bool = True,
+    allow_query: bool = False,
 ) -> None:
     """
-    Проверка подлинности вебхука по WEBHOOK_SECRET.
-    Защищает эндпоинты от подделки запросов и несанкционированного доступа.
+    Проверка подлинности вебхука по WEBHOOK_SECRET:
+    - Защищает эндпоинты от подделки запросов и несанкционированного доступа.
+    - Запрещает передачу секрета через URL-параметры (?secret=...) по умолчанию (защита от утечки в логах).
+    - В тестовом окружении без секретов разрешает вызовы.
     """
+    if settings.APP_ENV == "test":
+        return
+
     expected = settings.WEBHOOK_SECRET
     if not expected:
-        return
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Server configuration error: WEBHOOK_SECRET is not configured",
+        )
+
+    if settings.APP_ENV == "production" and expected == "super_secret_webhook_salt_123":
+        logger.critical("ВНИМАНИЕ БЕЗОПАСНОСТИ: В production используется дефолтный WEBHOOK_SECRET! Срочно задайте уникальный ключ в .env!")
 
     # 1. Проверяем специализированный заголовок (например, X-Telegram-Bot-Api-Secret-Token)
     if secret_header_name:
@@ -115,15 +171,11 @@ def verify_webhook_auth(
     elif auth_hdr and hmac.compare_digest(auth_hdr, expected):
         return
 
-    # 3. Query param ?secret=...
+    # 3. Query param ?secret=... (разрешен ТОЛЬКО если явно запрошен флагом allow_query)
     if allow_query:
         query_secret = request.query_params.get("secret") or request.query_params.get("token")
         if query_secret and hmac.compare_digest(query_secret, expected):
             return
-
-    # В тестовом окружении без секретов разрешаем вызовы
-    if settings.APP_ENV == "test":
-        return
 
     raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden: Invalid or missing webhook secret")
 
@@ -299,6 +351,16 @@ def _find_cart_item_index(target_name: str, items: list[dict[str, Any]]) -> int:
     raw_clean = re.sub(r"^\d+(?:[.,]\d+)?\s*(?:кг|гр|г|л|литр|шт|упак|пач|кор|бут|ящик|бан|порц)?\s*", "", target_name.strip().lower()).strip()
     search = raw_clean or target_name.strip().lower()
 
+    # Быстрый поиск по номеру позиции («1», «#1», «поз 2»)
+    if search.isdigit():
+        idx = int(search) - 1
+        if 0 <= idx < len(items):
+            return idx
+    if search.startswith("#") and search[1:].isdigit():
+        idx = int(search[1:]) - 1
+        if 0 <= idx < len(items):
+            return idx
+
     search_variants = {search}
     for k_syn, syn_list in HORECA_SYNONYMS.items():
         if k_syn in search:
@@ -342,9 +404,22 @@ def _merge_items(existing: list[MatchedItem], new_items: list[MatchedItem]) -> l
         if nm.sku_id:
             for ex in existing:
                 if ex.sku_id == nm.sku_id and ex.base_unit == nm.base_unit:
-                    ex.final_quantity = round(ex.final_quantity + nm.final_quantity, 3)
+                    ex.final_quantity = min(50000.0, round(ex.final_quantity + nm.final_quantity, 3))
                     ex.total_sum = round(ex.final_quantity * ex.price, 2)
-                    ex.raw_quantity = round(ex.raw_quantity + nm.raw_quantity, 3)
+                    ex.raw_quantity = min(50000.0, round(ex.raw_quantity + nm.raw_quantity, 3))
+                    # Пересчитываем предупреждение кратности тары для нового объема
+                    if ex.pack_multiple and ex.pack_multiple > 0 and ex.pack_multiple != 1.0:
+                        ratio = ex.final_quantity / ex.pack_multiple
+                        if math.isclose(ratio, round(ratio), rel_tol=1e-5, abs_tol=1e-5):
+                            ex.pack_warning = None
+                            ex.suggested_pack_quantity = None
+                        else:
+                            suggested_qty = float(math.ceil(round(ratio, 6)) * ex.pack_multiple)
+                            ex.suggested_pack_quantity = suggested_qty
+                            ex.pack_warning = (
+                                f"Отгрузка кратно {ex.pack_multiple:g} {ex.base_unit} (у вас {ex.final_quantity:g} {ex.base_unit}). "
+                                f"Округлить до {suggested_qty:g} {ex.base_unit}?"
+                            )
                     merged = True
                     break
         if not merged:
@@ -406,6 +481,17 @@ async def _apply_cart_update(
     items = draft.get("matched_items", [])
     if not (0 <= idx < len(items)):
         return False
+    if math.isnan(new_qty) or math.isinf(new_qty):
+        return False
+    if new_qty <= 0:
+        return await _apply_cart_delete(session_id, platform, chat_id, draft, idx)
+    if new_qty > 50000:
+        await dispatcher.send(OutboundMessage(
+            platform=platform,
+            chat_id=chat_id,
+            text="⚠️ <i>Количество превышает допустимый максимум (50 000).</i>",
+        ))
+        return True
     matched_it = MatchedItem.model_validate(items[idx])
     target_unit = unit_str or matched_it.raw_unit or matched_it.base_unit
     re_matched = await catalog_matcher.match_order_async([
@@ -439,7 +525,19 @@ async def _apply_analog_swap(
     if not re_matched:
         return False
 
-    items[target_idx] = re_matched[0].model_dump()
+    new_item = re_matched[0]
+    # Если заменяемый аналог уже есть в заказе, объединяем позиции без создания дублей
+    merged = False
+    for j, it in enumerate(items):
+        if j != target_idx and it.get("sku_id") == new_item.sku_id and it.get("base_unit") == new_item.base_unit:
+            it["final_quantity"] = round(it["final_quantity"] + new_item.final_quantity, 3)
+            it["raw_quantity"] = round(it.get("raw_quantity", 0.0) + new_item.raw_quantity, 3)
+            it["total_sum"] = round(it["final_quantity"] * it["price"], 2)
+            items.pop(target_idx)
+            merged = True
+            break
+    if not merged:
+        items[target_idx] = new_item.model_dump()
     draft["matched_items"] = items
     prefix = _fmt_msg(platform, f"🔄 Позиция #{target_idx + 1} заменена на аналог «{analog_name}»!\n\n", f"🔄 <i>Позиция #{target_idx + 1} заменена на аналог «{html.escape(analog_name)}»!</i>\n\n")
     await _save_and_send_card(session_id, platform, chat_id, draft, prefix=prefix)
@@ -535,7 +633,8 @@ async def execute_order_confirmation(
     Атомарная отправка заказа в 1С и Битрикс24 с защитой от повторных нажатий (Distributed Lock)
     и блокировкой при наличии нераспознанных позиций / товаров не на складе.
     """
-    if not await redis_client.acquire_lock(session_id, timeout=settings.LOCK_TIMEOUT_SEC):
+    lock_token = str(uuid.uuid4())
+    if not await redis_client.acquire_lock(session_id, timeout=settings.LOCK_TIMEOUT_SEC, lock_token=lock_token):
         await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text="⏳ <b>Заказ уже отправляется в 1С/Битрикс24, подождите...</b>"))
         return
 
@@ -591,6 +690,30 @@ async def execute_order_confirmation(
             await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text="⚠️ В заказе нет распознанных позиций для создания накладной в 1С."))
             return
 
+        # 4. Блокировка: товары с нулевой или отрицательной ценой (защита от несанкционированной бесплатной отгрузки)
+        zero_price_items = [it for it in valid_items if it.price <= 0 or math.isnan(it.price) or math.isinf(it.price)]
+        if zero_price_items:
+            names = ", ".join(f"«{it.catalog_name or it.raw_name}»" for it in zero_price_items)
+            msg = (
+                f"🚫 <b>Невозможно подтвердить заказ!</b>\n\n"
+                f"Для позиций не установлена цена в 1С: <b>{html.escape(names)}</b>.\n\n"
+                f"<i>Удалите позиции без цены («удали #{all_items.index(zero_price_items[0]) + 1}») или обратитесь к менеджеру.</i>"
+            )
+            await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg, buttons=get_default_buttons(all_items)))
+            return
+
+        # 5. Блокировка: некорректное количество товаров
+        invalid_qty_items = [it for it in valid_items if it.final_quantity <= 0 or math.isnan(it.final_quantity) or math.isinf(it.final_quantity)]
+        if invalid_qty_items:
+            names = ", ".join(f"«{it.catalog_name or it.raw_name}»" for it in invalid_qty_items)
+            msg = (
+                f"🚫 <b>Невозможно подтвердить заказ!</b>\n\n"
+                f"Некорректное количество товаров (должно быть > 0): <b>{html.escape(names)}</b>.\n\n"
+                f"<i>Уточните количество позиций перед подтверждением.</i>"
+            )
+            await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg, buttons=get_default_buttons(all_items)))
+            return
+
         delivery_date, raw_text = draft.get("delivery_date"), draft.get("raw_text", "")
         total_amount = sum(it.total_sum for it in valid_items)
 
@@ -617,9 +740,12 @@ async def execute_order_confirmation(
             chat_id=chat_id,
         )
 
-        # Обновляем статус заказа в БД
+        # Обновляем статус заказа в БД с защитой от сбоев
         from app.core.database import update_order_doc_number
-        await update_order_doc_number(order_record.id, result.document_number, result.state)
+        try:
+            await update_order_doc_number(order_record.id, result.document_number, result.state)
+        except Exception as upd_err:
+            logger.warning("Не удалось обновить статус OrderRecord #%s: %s", order_record.id, upd_err)
 
         await redis_client.clear_order_draft(session_id)
 
@@ -641,7 +767,7 @@ async def execute_order_confirmation(
         )
         await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=_fmt_msg(platform, plain_reply, html_reply)))
     finally:
-        await redis_client.release_lock(session_id)
+        await redis_client.release_lock(session_id, lock_token=lock_token)
 
 
 async def try_handle_cart_edit(
@@ -659,23 +785,38 @@ async def try_handle_cart_edit(
         return False
 
     if m := re.match(r"^(?:удали|убери|минус|вычеркни|сними)\s+(?:поз(?:ицию)?\s*)?#?(\d+)$", raw_lower):
-        if await _apply_cart_delete(session_id, platform, chat_id, draft, int(m.group(1)) - 1):
-            return True
+        try:
+            del_idx = int(m.group(1)) - 1
+            if await _apply_cart_delete(session_id, platform, chat_id, draft, del_idx):
+                return True
+        except (ValueError, OverflowError):
+            pass
 
     if m := re.match(r"^(?:поменяй|измени|сделай)\s+(?:поз(?:ицию)?\s*)?#?(\d+)\s+(?:на\s+)?(\d+(?:[.,]\d+)?)\s*([a-zA-Zа-яА-ЯёЁ]+)?$", raw_lower):
         idx_str, qty_str, unit_str = m.groups()
-        if await _apply_cart_update(session_id, platform, chat_id, draft, int(idx_str) - 1, float(qty_str.replace(",", ".")), unit_str):
-            return True
+        try:
+            target_idx = int(idx_str) - 1
+            qty_val = float(qty_str.replace(",", "."))
+            if await _apply_cart_update(session_id, platform, chat_id, draft, target_idx, qty_val, unit_str):
+                return True
+        except (ValueError, OverflowError):
+            pass
 
     if (m := re.match(r"^(?:copilot:analog:(\d+)|(?:замени|давай|положи|возьми)\s+(?:поз(?:ицию)?\s*)?#?(\d+)?\s*(?:на\s+)?аналог.*)$", raw_lower)) or "аналог" in raw_lower:
-        idx = int(m.group(1) or m.group(2)) - 1 if m and (m.group(1) or m.group(2)) else -1
-        if await _apply_analog_swap(session_id, platform, chat_id, draft, idx):
-            return True
+        try:
+            idx = int(m.group(1) or m.group(2)) - 1 if m and (m.group(1) or m.group(2)) else -1
+            if await _apply_analog_swap(session_id, platform, chat_id, draft, idx):
+                return True
+        except (ValueError, OverflowError):
+            pass
 
     if (m := re.match(r"^(?:copilot:round:(\d+)|(?:округли|кратно|добавь\s+до\s+пачки)\s*(?:поз(?:ицию)?\s*)?#?(\d+)?.*)$", raw_lower)) or "округли" in raw_lower:
-        idx = int(m.group(1) or m.group(2)) - 1 if m and (m.group(1) or m.group(2)) else -1
-        if await _apply_round_pack(session_id, platform, chat_id, draft, idx):
-            return True
+        try:
+            idx = int(m.group(1) or m.group(2)) - 1 if m and (m.group(1) or m.group(2)) else -1
+            if await _apply_round_pack(session_id, platform, chat_id, draft, idx):
+                return True
+        except (ValueError, OverflowError):
+            pass
 
     cart_item_names = [f"{it.get('catalog_name') or it.get('raw_name')} ({it.get('final_quantity', 1):g} {it.get('base_unit', 'шт')})" for it in items]
     cart_intent = await analyze_cart_intent(order_text, cart_item_names)
@@ -694,7 +835,9 @@ async def try_handle_cart_edit(
         match_idx = _find_cart_item_index(cart_intent.target_item or "", items)
         if match_idx >= 0:
             matched_it = MatchedItem.model_validate(items[match_idx])
-            new_qty = cart_intent.new_quantity or matched_it.final_quantity
+            new_qty = cart_intent.new_quantity if cart_intent.new_quantity is not None else matched_it.final_quantity
+            if new_qty <= 0:
+                return await _apply_cart_delete(session_id, platform, chat_id, draft, match_idx, by_name=True)
             unit = cart_intent.new_unit or matched_it.raw_unit or matched_it.base_unit
             return await _apply_cart_update(session_id, platform, chat_id, draft, match_idx, new_qty, unit)
 
@@ -739,8 +882,21 @@ async def try_handle_cart_edit(
 
 def _is_safe_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     """Проверка IP на отсутствие в приватных, петлевых, сервисных и зарезервированных диапазонах."""
-    if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
-        ip_obj = ip_obj.ipv4_mapped
+    if isinstance(ip_obj, ipaddress.IPv6Address):
+        if ip_obj.ipv4_mapped:
+            ip_obj = ip_obj.ipv4_mapped
+        elif ip_obj in ipaddress.IPv6Network("64:ff9b::/96"):
+            # NAT64 well-known prefix: extract embedded IPv4
+            embedded_ipv4 = ipaddress.IPv4Address(ip_obj.packed[-4:])
+            return _is_safe_ip(embedded_ipv4)
+        elif ip_obj in ipaddress.IPv6Network("2002::/16"):
+            # 6to4 prefix: extract embedded IPv4 from bytes 2:6
+            embedded_ipv4 = ipaddress.IPv4Address(ip_obj.packed[2:6])
+            return _is_safe_ip(embedded_ipv4)
+        elif ip_obj in ipaddress.IPv6Network("2001::/32"):
+            # Teredo prefix: extract client IPv4 from last 4 bytes (inverted)
+            embedded_ipv4 = ipaddress.IPv4Address(bytes(b ^ 0xFF for b in ip_obj.packed[-4:]))
+            return _is_safe_ip(embedded_ipv4)
 
     if (
         ip_obj.is_private
@@ -753,8 +909,20 @@ def _is_safe_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         return False
 
     if isinstance(ip_obj, ipaddress.IPv4Address):
+        # RFC 1122: 0.0.0.0/8 ("This network")
+        if ip_obj in ipaddress.IPv4Network("0.0.0.0/8"):
+            return False
         # Carrier-Grade NAT (RFC 6598: 100.64.0.0/10)
         if ip_obj in ipaddress.IPv4Network("100.64.0.0/10"):
+            return False
+        # IETF Protocol Assignments (RFC 6890: 192.0.0.0/24)
+        if ip_obj in ipaddress.IPv4Network("192.0.0.0/24"):
+            return False
+        # Network Benchmark tests (RFC 2544: 198.18.0.0/15)
+        if ip_obj in ipaddress.IPv4Network("198.18.0.0/15"):
+            return False
+        # Class E Reserved (RFC 1112: 240.0.0.0/4)
+        if ip_obj in ipaddress.IPv4Network("240.0.0.0/4"):
             return False
 
     return True
@@ -782,7 +950,7 @@ def _is_safe_url_for_download(url: str) -> bool:
         if hostname_clean in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
             return False
 
-        if parsed.port and parsed.port not in (80, 443, 8080, 8443):
+        if parsed.port and parsed.port not in (80, 443):
             return False
 
         # Если hostname передан как чистый IP-адрес
@@ -812,14 +980,16 @@ def _is_safe_url_for_download(url: str) -> bool:
 
 
 async def _download_audio(url: str) -> bytes | None:
-    """Безопасное скачивание аудио с защитой от SSRF, открытых редиректов и утечки MAX_BOT_TOKEN."""
-    if not _is_safe_url_for_download(url):
+    """Безопасное скачивание аудио с защитой от SSRF, неблокирующим DNS-резолвингом и санитизацией логов."""
+    is_safe = await asyncio.to_thread(_is_safe_url_for_download, url)
+    if not is_safe:
         logger.error("Заблокирована попытка SSRF по URL: %s", url)
         return None
 
     try:
         parsed = urllib.parse.urlparse(url)
         hostname = (parsed.hostname or "").lower()
+        safe_log_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
         # Токен MAX передается ТОЛЬКО на доверенный домен max.ru, а не на evil.com?max.ru
         headers = {}
@@ -827,36 +997,103 @@ async def _download_audio(url: str) -> bytes | None:
             headers["Authorization"] = settings.MAX_BOT_TOKEN
 
         # follow_redirects=False исключает обход SSRF через HTTP 302 редиректы на внутренние адреса
+        # Стриминговое скачивание с защитой от OOM (ранний обрыв при превышении 20 МБ)
+        max_bytes = 20 * 1024 * 1024
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=False) as client:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code == 200:
-                if len(resp.content) > 20 * 1024 * 1024:
-                    logger.error("Скачанный аудиофайл превышает максимальный размер 20 МБ: %s", url)
+            async with client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code != 200:
+                    logger.error("Ошибка скачивания аудио по URL %s: HTTP %d", safe_log_url, resp.status_code)
                     return None
-                return resp.content
-            logger.error("Ошибка скачивания аудио по URL %s: HTTP %d", url, resp.status_code)
+                chunks = []
+                total_bytes = 0
+                async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    total_bytes += len(chunk)
+                    if total_bytes > max_bytes:
+                        logger.error("Скачиваемый аудиофайл превышает лимит 20 МБ: %s", safe_log_url)
+                        return None
+                    chunks.append(chunk)
+                return b"".join(chunks)
     except Exception as exc:
-        logger.error("Не удалось скачать аудио по URL %s: %s", url, exc)
+        logger.error("Не удалось скачать аудио: %s", exc)
     return None
 
 
 async def _download_tg_file(file_id: str) -> bytes | None:
+    if not file_id or not re.match(r"^[A-Za-z0-9_\-]+$", str(file_id)):
+        logger.warning("Отклонен некорректный file_id Telegram: %s", file_id)
+        return None
     try:
         token = settings.TELEGRAM_BOT_TOKEN
-        async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=10.0) as client:
-            res = await client.get(f"https://api.telegram.org/bot{token}/getFile?file_id={file_id}")
+        if not token:
+            return None
+        async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=15.0) as client:
+            res = await client.get(
+                f"https://api.telegram.org/bot{token}/getFile",
+                params={"file_id": file_id},
+            )
             if res.status_code == 200 and (fp := res.json().get("result", {}).get("file_path")):
-                dl = await client.get(f"https://api.telegram.org/file/bot{token}/{fp}")
-                if dl.status_code == 200:
-                    return dl.content
+                fp_clean = str(fp).strip().replace("\\", "/")
+                if ".." in fp_clean or fp_clean.startswith(("/", "./")) or "//" in fp_clean or not re.match(r"^[a-zA-Z0-9_\-\./]+$", fp_clean):
+                    logger.warning("Отклонен небезопасный file_path Telegram: %s", fp_clean)
+                    return None
+
+                max_bytes = 20 * 1024 * 1024
+                async with client.stream("GET", f"https://api.telegram.org/file/bot{token}/{fp_clean}") as dl_resp:
+                    if dl_resp.status_code != 200:
+                        return None
+                    chunks = []
+                    total_bytes = 0
+                    async for chunk in dl_resp.aiter_bytes(chunk_size=65536):
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            logger.error("Аудиофайл Telegram превышает лимит 20 МБ")
+                            return None
+                        chunks.append(chunk)
+                    return b"".join(chunks)
     except Exception as exc:
-        logger.warning("Не удалось скачать аудиофайл Telegram: %s", exc)
+        safe_err = str(exc)
+        if token:
+            safe_err = safe_err.replace(token, "***")
+        safe_err = re.sub(r"bot[0-9]+:[A-Za-z0-9_\-]+", "bot***:***", safe_err)
+        logger.warning("Не удалось скачать аудиофайл Telegram: %s", safe_err)
     return None
 
 
-async def process_inbound_core(inbound: InboundMessage) -> None:
-    """Единое ядро обработки входящих сообщений изо всех каналов с блокировкой на сессию."""
+async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
+    """Внутренняя логика обработки входящих сообщений."""
     session_id, platform, chat_id = inbound.session_id, inbound.platform, inbound.chat_id
+
+    # 1. Валидация B2B-контрагента (при включенном флаге REQUIRE_CLIENT_AUTH)
+    if settings.REQUIRE_CLIENT_AUTH and settings.APP_ENV != "test":
+        from app.core.database import get_client_binding
+        client = await get_client_binding(platform, inbound.platform_user_id) or (
+            await get_client_binding(platform, inbound.chat_id) if inbound.chat_id != inbound.platform_user_id else None
+        )
+        if not client:
+            if (inbound.text or "").strip().lower() in ("/start", "start"):
+                msg = (
+                    "👋 <b>Добро пожаловать в B2B HoReCa Order Co-Pilot!</b>\n\n"
+                    "Ваш аккаунт еще не привязан к договору поставки.\n"
+                    f"Ваш ID: <code>{html.escape(inbound.platform_user_id)}</code> ({platform}).\n\n"
+                    "Передайте этот ID вашему персональному менеджеру для привязки карточки ресторана."
+                )
+            else:
+                msg = (
+                    "🔒 <b>Доступ заблокирован</b>\n\n"
+                    "Вы не авторизованы как представитель контрагента.\n"
+                    f"Передайте менеджеру ваш ID: <code>{html.escape(inbound.platform_user_id)}</code> ({platform}) для привязки к ИНН."
+                )
+            await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg))
+            return
+
+    # 2. Защита от DoS и спама (Rate Limiter по сессии)
+    if not await redis_client.check_rate_limit(session_id, max_requests=settings.RATE_LIMIT_PER_MINUTE):
+        await dispatcher.send(OutboundMessage(
+            platform=platform,
+            chat_id=chat_id,
+            text="⏳ <b>Слишком много запросов.</b> Пожалуйста, подождите минуту перед следующим сообщением.",
+        ))
+        return
 
     # Блокировка на уровне сессии предотвращает состояние гонки по черновику
     async with _session_locks[session_id]:
@@ -874,11 +1111,25 @@ async def process_inbound_core(inbound: InboundMessage) -> None:
             if action.startswith("copilot:del:"):
                 try:
                     del_idx = int(action.split(":")[-1]) - 1
-                    if (draft := await redis_client.get_order_draft(session_id)) and draft.get("matched_items"):
-                        await _apply_cart_delete(session_id, platform, chat_id, draft, del_idx)
+                    draft = await redis_client.get_order_draft(session_id)
+                    if draft and draft.get("matched_items"):
+                        if not await _apply_cart_delete(session_id, platform, chat_id, draft, del_idx):
+                            await dispatcher.send(OutboundMessage(
+                                platform=platform,
+                                chat_id=chat_id,
+                                text="ℹ️ <i>Эта позиция уже была удалена ранее.</i>",
+                            ))
+                        return
+                    else:
+                        await dispatcher.send(OutboundMessage(
+                            platform=platform,
+                            chat_id=chat_id,
+                            text="⚠️ <i>Корзина пуста или заказ уже оформлен.</i>",
+                        ))
                         return
                 except Exception as exc:
                     logger.warning("Ошибка обработки copilot:del: %s", exc)
+                    return
             elif action.startswith("copilot:analog:"):
                 try:
                     idx = int(action.split(":")[-1]) - 1
@@ -910,13 +1161,26 @@ async def process_inbound_core(inbound: InboundMessage) -> None:
                     await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg))
                     return
             except Exception as exc:
-                logger.error("Сбой распознавания аудио SpeechKit: %s", exc)
-                await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text="❌ Ошибка распознавания речи в Yandex SpeechKit. Попробуйте написать текстом."))
+                logger.error("Сбой распознавания аудио: %s", exc)
+                await dispatcher.send(OutboundMessage(
+                    platform=platform,
+                    chat_id=chat_id,
+                    text="❌ Не удалось распознать речь. Попробуйте написать заказ текстом.",
+                ))
                 return
 
-        order_text = (recognized_text or inbound.text or "").strip()
+        order_text = (recognized_text or inbound.text or "").strip().replace("\x00", "")
         if not order_text:
             await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text="⚠️ Пожалуйста, отправьте заказ текстом или голосовым сообщением."))
+            return
+
+        # 3. Защита от DoS и слива LLM-токенов при аномально длинных входящих сообщениях
+        if len(order_text) > settings.MAX_TEXT_LENGTH:
+            await dispatcher.send(OutboundMessage(
+                platform=platform,
+                chat_id=chat_id,
+                text=f"⚠️ Текст заказа слишком длинный (максимум {settings.MAX_TEXT_LENGTH} символов). Пожалуйста, сократите заказ.",
+            ))
             return
 
         if order_text in ("/start", "start"):
@@ -949,6 +1213,32 @@ async def process_inbound_core(inbound: InboundMessage) -> None:
             return
 
         if order_text in ("/sync", "sync"):
+            # Проверка прав администратора с жесткой изоляцией по платформе мессенджера
+            is_admin = (
+                settings.APP_ENV == "test"
+                or f"{platform}:{inbound.platform_user_id}" in settings.ADMIN_USER_IDS
+                or (inbound.platform_user_id in settings.ADMIN_USER_IDS and platform == "telegram")
+            )
+            if not is_admin:
+                logger.warning("Попытка несанкционированного вызова /sync пользователем %s:%s", platform, inbound.platform_user_id)
+                await dispatcher.send(OutboundMessage(
+                    platform=platform,
+                    chat_id=chat_id,
+                    text="⛔ <i>Команда доступна только администраторам системы.</i>",
+                ))
+                return
+
+            # Защита от частого дергания синхронизации (cooldown 30 сек через lock)
+            sync_lock_key = "lock:catalog_sync_cooldown"
+            acquired = await redis_client.acquire_lock(sync_lock_key, timeout=30)
+            if not acquired:
+                await dispatcher.send(OutboundMessage(
+                    platform=platform,
+                    chat_id=chat_id,
+                    text="⏳ <i>Синхронизация уже запущена или выполнялась менее 30 сек. назад. Подождите...</i>",
+                ))
+                return
+
             try:
                 synced = await sync_catalog_from_bitrix()
                 if synced:
@@ -1001,6 +1291,22 @@ async def process_inbound_core(inbound: InboundMessage) -> None:
         await _save_and_send_card(session_id, platform, chat_id, new_draft, prefix=prefix, missing_hints=missing_items)
 
 
+async def process_inbound_core(inbound: InboundMessage) -> None:
+    """Единое ядро обработки входящих сообщений изо всех каналов с глобальным перехватом ошибок."""
+    try:
+        await _process_inbound_core_impl(inbound)
+    except Exception as exc:
+        logger.exception("Критический сбой обработки сообщения (%s:%s): %s", inbound.platform, inbound.platform_user_id, exc)
+        try:
+            await dispatcher.send(OutboundMessage(
+                platform=inbound.platform,
+                chat_id=inbound.chat_id,
+                text="⚠️ <b>Произошла временная ошибка при обработке заказа.</b> Пожалуйста, повторите попытку.",
+            ))
+        except Exception:
+            pass
+
+
 # =========================================================================
 # ВЕБХУКИ МЕССЕНДЖЕРОВ С АВТОРИЗАЦИЕЙ И БЫСТРЫМ ОТВЕТОМ
 # =========================================================================
@@ -1008,7 +1314,13 @@ async def process_inbound_core(inbound: InboundMessage) -> None:
 async def telegram_webhook(request: Request) -> dict[str, Any]:
     """Вебхук Telegram Bot API с авторизацией secret_token и защитой от дублей."""
     verify_webhook_auth(request, secret_header_name="X-Telegram-Bot-Api-Secret-Token")
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
 
     if update_id := data.get("update_id"):
         if _is_duplicate_update(f"tg:{update_id}"):
@@ -1016,20 +1328,40 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
 
     inbound = None
     if cb := data.get("callback_query"):
-        u_id = str(cb.get("from", {}).get("id", ""))
-        chat_id = str(cb.get("message", {}).get("chat", {}).get("id", u_id))
-        inbound = InboundMessage(
-            platform="telegram", platform_user_id=u_id, chat_id=chat_id, callback_data=cb.get("data")
-        )
+        if isinstance(cb, dict):
+            from_obj = cb.get("from")
+            u_id = str(from_obj.get("id", "")) if isinstance(from_obj, dict) else ""
+            msg_obj = cb.get("message")
+            chat_obj = msg_obj.get("chat") if isinstance(msg_obj, dict) else None
+            chat_id = str(chat_obj.get("id", u_id)) if isinstance(chat_obj, dict) else u_id
+            cb_id = cb.get("id")
+            if cb_id and settings.TELEGRAM_BOT_TOKEN:
+                async def _ack_tg_cb(cid=cb_id):
+                    try:
+                        async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=5.0) as cl:
+                            await cl.post(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/answerCallbackQuery", json={"callback_query_id": cid})
+                    except Exception:
+                        pass
+                asyncio.create_task(_ack_tg_cb())
+            if u_id:
+                inbound = InboundMessage(
+                    platform="telegram", platform_user_id=u_id, chat_id=chat_id, callback_data=cb.get("data")
+                )
 
     elif msg := data.get("message"):
-        u_id = str(msg.get("from", {}).get("id", ""))
-        chat_id = str(msg.get("chat", {}).get("id", u_id))
-        voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
-        voice_bytes = await _download_tg_file(voice.get("file_id")) if voice and settings.TELEGRAM_BOT_TOKEN else None
-        inbound = InboundMessage(
-            platform="telegram", platform_user_id=u_id, chat_id=chat_id, text=msg.get("text"), voice_bytes=voice_bytes
-        )
+        if isinstance(msg, dict):
+            from_obj = msg.get("from")
+            u_id = str(from_obj.get("id", "")) if isinstance(from_obj, dict) else ""
+            chat_obj = msg.get("chat")
+            chat_id = str(chat_obj.get("id", u_id)) if isinstance(chat_obj, dict) else u_id
+            voice = msg.get("voice") or msg.get("audio") or msg.get("video_note")
+            file_id = voice.get("file_id") if isinstance(voice, dict) else None
+            voice_bytes = await _download_tg_file(file_id) if file_id and settings.TELEGRAM_BOT_TOKEN else None
+            text = msg.get("text") or msg.get("caption")
+            if u_id:
+                inbound = InboundMessage(
+                    platform="telegram", platform_user_id=u_id, chat_id=chat_id, text=text, voice_bytes=voice_bytes
+                )
 
     if inbound:
         # Быстрый ответ с фоновой обработкой, либо синхронно в тестовом режиме
@@ -1043,48 +1375,97 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
 
 @router.post("/vk")
 async def vk_webhook(request: Request) -> Response:
-    """Вебхук ВКонтакте Callback API с валидацией secret и confirmation."""
-    data = await request.json()
+    """Вебхук ВКонтакте Callback API с обязательной валидацией secret / WEBHOOK_SECRET и confirmation."""
+    try:
+        data = await request.json()
+    except Exception:
+        return Response(content="Invalid JSON", status_code=400, media_type="text/plain")
 
-    if settings.VK_SECRET_KEY and data.get("type") != "confirmation":
-        provided_secret = str(data.get("secret") or "")
-        if not hmac.compare_digest(provided_secret, settings.VK_SECRET_KEY):
-            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid VK secret")
+    if not isinstance(data, dict):
+        return Response(content="Expected JSON object", status_code=400, media_type="text/plain")
 
     event_type = data.get("type")
     if event_type == "confirmation":
-        return Response(content=settings.VK_CONFIRMATION_CODE, media_type="text/plain")
+        if settings.APP_ENV != "test" and settings.VK_SECRET_KEY:
+            provided_secret = str(data.get("secret") or "")
+            if not hmac.compare_digest(provided_secret, settings.VK_SECRET_KEY):
+                raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid VK secret")
+        elif settings.APP_ENV != "test":
+            verify_webhook_auth(request)
+        if not settings.VK_CONFIRMATION_CODE:
+            logger.warning("VK_CONFIRMATION_CODE не настроен в .env")
+        return Response(content=settings.VK_CONFIRMATION_CODE or "", media_type="text/plain")
 
-    obj = data.get("object", {})
+    if settings.VK_SECRET_KEY:
+        provided_secret = str(data.get("secret") or "")
+        if not hmac.compare_digest(provided_secret, settings.VK_SECRET_KEY):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid VK secret")
+    else:
+        verify_webhook_auth(request)
+
+    obj = data.get("object")
+    if not isinstance(obj, dict):
+        obj = {}
     inbound = None
 
     if event_type == "message_new":
-        msg = obj.get("message", {})
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            msg = {}
         msg_id = msg.get("id") or msg.get("conversation_message_id")
         if msg_id and _is_duplicate_update(f"vk:{msg_id}"):
             return Response(content="ok", media_type="text/plain")
 
-        uid = str(msg.get("from_id", ""))
-        voice_url = next(
-            (att.get(att.get("type"), {}).get("link_ogg") or att.get(att.get("type"), {}).get("url")
-             for att in msg.get("attachments", []) if att.get("type") in ("audio_message", "doc")),
-            None,
-        )
-        inbound = InboundMessage(
-            platform="vk", platform_user_id=uid, chat_id=str(msg.get("peer_id", uid)), text=msg.get("text", ""), voice_url=voice_url
-        )
+        uid = str(msg.get("from_id") or "").strip()
+        peer_id = str(msg.get("peer_id") or uid).strip()
+        raw_atts = msg.get("attachments")
+        attachments = raw_atts if isinstance(raw_atts, list) else []
+        voice_url = None
+        for att in attachments:
+            if isinstance(att, dict) and att.get("type") in ("audio_message", "doc"):
+                sub_dict = att.get(att.get("type"))
+                if isinstance(sub_dict, dict):
+                    voice_url = sub_dict.get("link_ogg") or sub_dict.get("url")
+                    if voice_url:
+                        break
+        if uid:
+            inbound = InboundMessage(
+                platform="vk", platform_user_id=uid, chat_id=peer_id, text=msg.get("text", ""), voice_url=voice_url
+            )
 
     elif event_type == "message_event":
-        uid = str(obj.get("user_id", ""))
-        raw_payload = obj.get("payload", {})
+        uid = str(obj.get("user_id") or "").strip()
+        peer_id = str(obj.get("peer_id") or uid).strip()
+        if ev_id := obj.get("event_id"):
+            token = settings.VK_GROUP_TOKEN
+            if token and uid.isdigit() and peer_id.lstrip("-").isdigit():
+                async def _ack_vk_event(eid=ev_id, u=int(uid), p=int(peer_id), tok=token):
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as cl:
+                            await cl.post(
+                                "https://api.vk.com/method/messages.sendMessageEventAnswer",
+                                data={"event_id": eid, "user_id": u, "peer_id": p, "access_token": tok, "v": "5.199"},
+                            )
+                    except Exception:
+                        pass
+                asyncio.create_task(_ack_vk_event())
+        raw_payload = obj.get("payload")
+        action = None
         if isinstance(raw_payload, str):
             try:
-                raw_payload = json.loads(raw_payload)
+                parsed_p = json.loads(raw_payload)
+                action = parsed_p.get("action") if isinstance(parsed_p, dict) else str(parsed_p)
             except Exception:
-                raw_payload = {"action": raw_payload}
-        inbound = InboundMessage(
-            platform="vk", platform_user_id=uid, chat_id=str(obj.get("peer_id", uid)), callback_data=raw_payload.get("action")
-        )
+                action = raw_payload
+        elif isinstance(raw_payload, dict):
+            action = raw_payload.get("action")
+        elif raw_payload is not None:
+            action = str(raw_payload)
+
+        if uid:
+            inbound = InboundMessage(
+                platform="vk", platform_user_id=uid, chat_id=peer_id, callback_data=action
+            )
 
     if inbound:
         if settings.APP_ENV == "test":
@@ -1099,7 +1480,14 @@ async def vk_webhook(request: Request) -> Response:
 async def whatsapp_webhook(request: Request) -> dict[str, str]:
     """Вебхук WhatsApp (Green-API) с авторизацией и дедупликацией."""
     verify_webhook_auth(request)
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+
     if data.get("typeWebhook") != "incomingMessageReceived":
         return {"status": "ok"}
 
@@ -1107,28 +1495,34 @@ async def whatsapp_webhook(request: Request) -> dict[str, str]:
     if msg_id and _is_duplicate_update(f"wa:{msg_id}"):
         return {"status": "ok"}
 
-    msg_data, sender_data = data.get("messageData", {}), data.get("senderData", {})
-    sender_id = sender_data.get("sender", "").replace("@c.us", "")
-    chat_id = sender_data.get("chatId", sender_id)
+    raw_mdata = data.get("messageData")
+    msg_data = raw_mdata if isinstance(raw_mdata, dict) else {}
+    raw_sdata = data.get("senderData")
+    sender_data = raw_sdata if isinstance(raw_sdata, dict) else {}
+    sender_id = str(sender_data.get("sender") or "").replace("@c.us", "").strip()
+    chat_id = str(sender_data.get("chatId") or sender_id).strip()
     type_msg = msg_data.get("typeMessage")
 
     text, voice_url, callback_data = None, None, None
     if type_msg == "textMessage":
-        text = msg_data.get("textMessageData", {}).get("textMessage")
+        raw_tdata = msg_data.get("textMessageData")
+        text = raw_tdata.get("textMessage") if isinstance(raw_tdata, dict) else None
     elif type_msg == "extendedTextMessage":
-        text = msg_data.get("extendedTextMessageData", {}).get("text")
+        raw_edata = msg_data.get("extendedTextMessageData")
+        text = raw_edata.get("text") if isinstance(raw_edata, dict) else None
     elif type_msg in ("audioMessage", "voiceMessage"):
-        voice_url = msg_data.get("fileMessageData", {}).get("downloadUrl")
+        raw_fdata = msg_data.get("fileMessageData")
+        voice_url = raw_fdata.get("downloadUrl") if isinstance(raw_fdata, dict) else None
     elif type_msg in ("buttonsResponseMessage", "templateButtonReplyMessage", "interactiveButtonsResponse"):
         btn = (
             msg_data.get("interactiveButtonsResponse")
             or msg_data.get("buttonsResponseMessage")
             or msg_data.get("buttonsResponseMessageData")
             or msg_data.get("templateButtonReplyMessage")
-            or {}
         )
-        callback_data = btn.get("selectedId") or btn.get("selectedButtonId")
-        text = btn.get("selectedDisplayText") or btn.get("selectedButtonText") or callback_data
+        if isinstance(btn, dict):
+            callback_data = btn.get("selectedId") or btn.get("selectedButtonId")
+            text = btn.get("selectedDisplayText") or btn.get("selectedButtonText") or callback_data
 
     if sender_id and (text or voice_url or callback_data):
         inbound = InboundMessage(
@@ -1147,7 +1541,7 @@ async def viber_webhook(
     request: Request,
     x_viber_content_signature: str | None = Header(None, alias="X-Viber-Content-Signature"),
 ) -> dict[str, Any]:
-    """Вебхук Viber REST API с обязательной валидацией HMAC SHA-256 подписи."""
+    """Вебхук Viber REST API с обязательной валидацией HMAC SHA-256 подписи и дедупликацией."""
     raw_body = await request.body()
 
     if settings.VIBER_AUTH_TOKEN:
@@ -1156,56 +1550,104 @@ async def viber_webhook(
         sig = hmac.new(settings.VIBER_AUTH_TOKEN.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, x_viber_content_signature):
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid Viber signature")
+    else:
+        verify_webhook_auth(request)
 
-    data = json.loads(raw_body.decode("utf-8")) if raw_body else {}
+    try:
+        data = json.loads(raw_body.decode("utf-8", errors="replace")) if raw_body else {}
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON in Viber payload")
+
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+
     if data.get("event") == "webhook":
         return {"status": 0, "message": "ok"}
 
+    msg_token = data.get("message_token")
+    if msg_token and _is_duplicate_update(f"viber:{msg_token}"):
+        return {"status": 0}
+
     if data.get("event") == "message":
-        uid = str(data.get("sender", {}).get("id", ""))
-        msg = data.get("message", {})
+        sender = data.get("sender")
+        uid = str(sender.get("id", "")) if isinstance(sender, dict) else ""
+        msg = data.get("message")
+        if not isinstance(msg, dict):
+            msg = {}
         voice_url = msg.get("media") if msg.get("type") in ("voice", "audio", "file") else None
-        inbound = InboundMessage(
-            platform="viber", platform_user_id=uid, chat_id=uid, text=msg.get("text"), voice_url=voice_url
-        )
-        if settings.APP_ENV == "test":
-            await process_inbound_core(inbound)
-        else:
-            asyncio.create_task(process_inbound_core(inbound))
+        if uid:
+            inbound = InboundMessage(
+                platform="viber", platform_user_id=uid, chat_id=uid, text=msg.get("text"), voice_url=voice_url
+            )
+            if settings.APP_ENV == "test":
+                await process_inbound_core(inbound)
+            else:
+                asyncio.create_task(process_inbound_core(inbound))
 
     return {"status": 0}
 
 
 @router.post("/max")
 async def max_webhook(request: Request) -> dict[str, str]:
-    """Вебхук корпоративного мессенджера MAX с поддержкой как событийного, так и прямого формата."""
+    """Вебхук корпоративного мессенджера MAX с поддержкой событийного/прямого формата и дедупликацией."""
     verify_webhook_auth(request)
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
-    # Универсальный парсер: обрабатывает оба формата (platform updates / direct)
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object")
+
+    # Дедупликация входящих апдейтов MAX
+    msg_obj = data.get("message") if isinstance(data.get("message"), dict) else {}
+    body_obj = msg_obj.get("body") if isinstance(msg_obj.get("body"), dict) else {}
+    update_key = (
+        data.get("update_id")
+        or data.get("message_id")
+        or data.get("callback_id")
+        or body_obj.get("message_id")
+    )
+    if update_key and _is_duplicate_update(f"max:{update_key}"):
+        return {"status": "ok"}
+
     uid, chat_id, text, voice_url, callback_data = "", "", None, None, None
 
     u_type = data.get("update_type")
     if u_type == "message_created":
-        msg = data.get("message", {})
-        body = msg.get("body", {})
-        sender = msg.get("sender", {})
-        uid = str(sender.get("user_id") or "")
-        chat_id = str(msg.get("recipient", {}).get("chat_id") or uid)
+        msg = msg_obj
+        body = body_obj
+        sender = msg.get("sender") if isinstance(msg.get("sender"), dict) else {}
+        uid = str(sender.get("user_id") or msg.get("sender_id") or "").strip()
+        if not uid:
+            logger.warning("Отклонено сообщение MAX без user_id: %s", data)
+            return {"status": "error", "message": "Missing sender user_id"}
+        chat_id = str(msg.get("recipient", {}).get("chat_id") if isinstance(msg.get("recipient"), dict) else uid)
         text = body.get("text")
+        raw_atts = body.get("attachments")
+        attachments = raw_atts if isinstance(raw_atts, list) else []
         voice_url = next(
             (att.get("payload", {}).get("url") if isinstance(att.get("payload"), dict) else att.get("url")
-             for att in body.get("attachments", []) if att.get("type") in ("audio", "voice", "file")),
+             for att in attachments if isinstance(att, dict) and att.get("type") in ("audio", "voice", "file")),
             None,
         )
     elif u_type == "message_callback":
-        cb = data.get("callback", {})
-        uid = str(cb.get("user", {}).get("user_id") or cb.get("user_id") or "")
-        chat_id = str(cb.get("message", {}).get("recipient", {}).get("chat_id") or uid)
+        cb = data.get("callback") if isinstance(data.get("callback"), dict) else {}
+        user_obj = cb.get("user") if isinstance(cb.get("user"), dict) else {}
+        uid = str(user_obj.get("user_id") or cb.get("user_id") or "").strip()
+        if not uid:
+            logger.warning("Отклонен callback MAX без user_id: %s", data)
+            return {"status": "error", "message": "Missing callback user_id"}
+        cb_msg = cb.get("message") if isinstance(cb.get("message"), dict) else {}
+        recipient_obj = cb_msg.get("recipient") if isinstance(cb_msg.get("recipient"), dict) else {}
+        chat_id = str(recipient_obj.get("chat_id") or uid)
         callback_data = str(cb.get("payload") or "")
     else:
         # Прямой формат
-        uid = str(data.get("user_id") or data.get("sender_id", "default_user"))
+        uid = str(data.get("user_id") or data.get("sender_id") or "").strip()
+        if not uid or uid == "default_user":
+            logger.warning("Отклонен прямой запрос MAX без валидного user_id: %s", data)
+            return {"status": "error", "message": "Missing or invalid user_id"}
         chat_id = str(data.get("chat_id") or uid)
         text = data.get("text")
         voice_url = data.get("voice_url") or data.get("audio_url")
@@ -1258,6 +1700,7 @@ async def update_order_status(
 
     async with async_session_factory() as session:
         # Точный поиск: равенство или точное совпадение токена в составном номере "ЗК-1 / Б24-2"
+        # а также поддержка суффиксов очереди Outbox: "ЗК-1 (остальное в OUTBOX-2)"
         stmt = (
             select(OrderRecord)
             .where(
@@ -1265,6 +1708,8 @@ async def update_order_status(
                 | (OrderRecord.document_number_1c.like(f"{safe_target} / %", escape="\\"))
                 | (OrderRecord.document_number_1c.like(f"% / {safe_target}", escape="\\"))
                 | (OrderRecord.document_number_1c.like(f"% / {safe_target} / %", escape="\\"))
+                | (OrderRecord.document_number_1c.like(f"{safe_target} %", escape="\\"))
+                | (OrderRecord.document_number_1c.like(f"% / {safe_target} %", escape="\\"))
             )
             .order_by(OrderRecord.id.desc())
         )
@@ -1276,7 +1721,7 @@ async def update_order_status(
         order.status = payload.status
         await session.commit()
 
-        chat_id = order.session_id.split(":", 1)[1] if ":" in order.session_id else order.session_id
+        chat_id = extract_chat_id_from_session(order.session_id)
         comment_part = f"\n💬 <i>{html.escape(payload.comment)}</i>" if payload.comment else ""
         text = (
             f"🚚 <b>Статус заказа <code>{html.escape(target_doc)}</code> обновлен!</b>\n\n"
@@ -1317,8 +1762,8 @@ async def bitrix_catalog_webhook(request: Request) -> dict[str, Any]:
 
 
 class OneCStockUpdate(BaseModel):
-    sku_id: str
-    stock_quantity: float = 0.0
+    sku_id: str = Field(..., min_length=1, max_length=128)
+    stock_quantity: float = Field(default=0.0, ge=0.0, le=1000000.0)
     in_stop_list: bool = False
 
 

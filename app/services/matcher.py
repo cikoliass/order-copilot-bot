@@ -2,6 +2,7 @@ import asyncio
 import logging
 import math
 import re
+import time
 from typing import Any, Optional
 from rapidfuzz import fuzz
 from app.core.config import settings
@@ -53,6 +54,14 @@ class CatalogMatcher:
         self._ambiguous_aliases: set[str] = set()
         self._stop_list: set[str] = set()
         self._stock_overrides: dict[str, float] = {}
+        self._last_sync_time: float = 0.0
+        self.SYNC_TTL_SECONDS: float = 3600.0
+
+    def is_stale(self) -> bool:
+        """Проверяет устаревание кэша каталога в RAM для предотвращения рассинхрона цен."""
+        if not self.catalog:
+            return True
+        return (time.time() - self._last_sync_time) > self.SYNC_TTL_SECONDS
 
     async def restore_state_from_redis(self) -> None:
         """Восстановление стоп-листа и остатков из Redis при рестарте."""
@@ -112,7 +121,7 @@ class CatalogMatcher:
                 continue
             if self.get_stock(entry) <= 0:
                 continue
-            if entry.base_unit != out_of_stock_sku.base_unit:
+            if normalize_unit(entry.base_unit) != normalize_unit(out_of_stock_sku.base_unit):
                 continue
 
             cand_name = entry.name.lower()
@@ -132,36 +141,38 @@ class CatalogMatcher:
         return None
 
     def reload(self, raw_items: Optional[list[dict[str, Any]]] = None) -> None:
-        """Перезагрузка каталога напрямую из списка товаров Битрикс24 (хранение в RAM)."""
-        if raw_items is not None:
-            self.catalog = [CatalogSKU.from_raw(it) for it in raw_items]
-        else:
-            self.catalog = []
+        """Потокобезопасная перезагрузка каталога напрямую из списка товаров Битрикс24 (хранение в RAM)."""
+        new_catalog = [CatalogSKU.from_raw(it) for it in raw_items] if raw_items is not None else []
 
-        # Построение быстрого индекса точных совпадений без перезаписи дублей
-        self._exact_alias_index.clear()
-        self._ambiguous_aliases.clear()
+        # Построение быстрого индекса точных совпадений в локальных структурах (без блокировки читателей)
+        new_exact_index: dict[str, CatalogSKU] = {}
+        new_ambiguous: set[str] = set()
 
-        for sku in self.catalog:
+        for sku in new_catalog:
             norm_name = sku.name.lower().strip()
-            if norm_name in self._exact_alias_index and self._exact_alias_index[norm_name].sku_id != sku.sku_id:
-                self._ambiguous_aliases.add(norm_name)
+            if norm_name in new_exact_index and new_exact_index[norm_name].sku_id != sku.sku_id:
+                new_ambiguous.add(norm_name)
             else:
-                self._exact_alias_index[norm_name] = sku
+                new_exact_index[norm_name] = sku
 
             for alias in sku.aliases:
                 norm_a = alias.lower().strip()
                 if not norm_a:
                     continue
-                if norm_a in self._exact_alias_index and self._exact_alias_index[norm_a].sku_id != sku.sku_id:
-                    self._ambiguous_aliases.add(norm_a)
+                if norm_a in new_exact_index and new_exact_index[norm_a].sku_id != sku.sku_id:
+                    new_ambiguous.add(norm_a)
                 else:
-                    self._exact_alias_index[norm_a] = sku
+                    new_exact_index[norm_a] = sku
 
         # Удаляем коллизии из точного индекса
-        for amb in self._ambiguous_aliases:
-            self._exact_alias_index.pop(amb, None)
+        for amb in new_ambiguous:
+            new_exact_index.pop(amb, None)
 
+        # Атомарная замена указателей (thread-safe swap)
+        self.catalog = new_catalog
+        self._exact_alias_index = new_exact_index
+        self._ambiguous_aliases = new_ambiguous
+        self._last_sync_time = time.time()
         logger.info("Каталог номенклатуры в памяти обновлен: %d товаров из Битрикс24", len(self.catalog))
 
     def _calc_fuzzy_score(self, query: str, cand: str) -> float:
@@ -189,7 +200,14 @@ class CatalogMatcher:
 
     def _match_single_sync(self, raw_item: RawItem) -> MatchedItem:
         raw_name = raw_item.raw_name.strip()
-        raw_qty = float(raw_item.quantity if raw_item.quantity > 0 else 1.0)
+        try:
+            raw_qty = float(raw_item.quantity)
+            if raw_qty <= 0 or math.isnan(raw_qty) or math.isinf(raw_qty):
+                raw_qty = 1.0
+            elif raw_qty > 50000.0:
+                raw_qty = 50000.0
+        except (ValueError, TypeError):
+            raw_qty = 1.0
         norm_raw_unit = normalize_unit(raw_item.unit)
         note = raw_item.note
 
@@ -247,12 +265,16 @@ class CatalogMatcher:
 
         if norm_raw_unit in rates:
             factor = rates[norm_raw_unit]
-            final_qty = round(raw_qty * factor, 3)
-            if norm_raw_unit != base_unit or factor != 1.0:
-                recalc_hint = f"из {raw_qty:g} {norm_raw_unit} × {factor:g}"
+            if factor <= 0 or math.isnan(factor) or math.isinf(factor):
+                unit_matched = False
+                recalc_hint = f"некорректный коэффициент тары «{norm_raw_unit}»"
+            else:
+                final_qty = max(0.001, round(raw_qty * factor, 3))
+                if norm_raw_unit != base_unit or factor != 1.0:
+                    recalc_hint = f"из {raw_qty:g} {norm_raw_unit} × {factor:g}"
         elif (norm_raw_unit, base_unit) in PHYSICAL_CONVERSIONS:
             factor = PHYSICAL_CONVERSIONS[(norm_raw_unit, base_unit)]
-            final_qty = round(raw_qty * factor, 3)
+            final_qty = max(0.001, round(raw_qty * factor, 3))
             recalc_hint = f"из {raw_qty:g} {norm_raw_unit} пересчитано в {final_qty:g} {base_unit}"
         elif norm_raw_unit == base_unit:
             final_qty = raw_qty
@@ -268,11 +290,12 @@ class CatalogMatcher:
         suggested_pack_quantity: Optional[float] = None
         pack_warning: Optional[str] = None
 
-        if settings.CHECK_PACK_MULTIPLES and pack_multiple and pack_multiple > 1.0:
+        if settings.CHECK_PACK_MULTIPLES and pack_multiple and pack_multiple > 0 and pack_multiple != 1.0:
             if norm_raw_unit == base_unit:
-                rem = final_qty % pack_multiple
-                if rem != 0:
-                    suggested_qty = float(math.ceil(final_qty / pack_multiple) * pack_multiple)
+                ratio = final_qty / pack_multiple
+                is_multiple = math.isclose(ratio, round(ratio), rel_tol=1e-5, abs_tol=1e-5)
+                if not is_multiple:
+                    suggested_qty = float(math.ceil(round(ratio, 6)) * pack_multiple)
                     suggested_pack_quantity = suggested_qty
                     pack_warning = (
                         f"Отгрузка кратно {pack_multiple:g} {base_unit} (у вас {final_qty:g} {base_unit}). "

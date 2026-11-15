@@ -14,10 +14,10 @@ class RawItem(BaseModel):
     """Сырая товарная позиция, извлеченная нейросетью из текста/голоса."""
     model_config = ConfigDict(extra="ignore")
 
-    raw_name: str = Field(..., description="Исходное наименование товара")
-    quantity: float = Field(default=1.0, description="Количество")
-    unit: str = Field(default="шт", description="Единица измерения (кг, коробка, мешок, шт)")
-    note: Optional[str] = Field(default=None, description="Примечание/пожелание к позиции")
+    raw_name: str = Field(..., min_length=1, max_length=255, description="Исходное наименование товара")
+    quantity: float = Field(default=1.0, gt=0, le=50000.0, description="Количество (строго > 0 и <= 50000)")
+    unit: str = Field(default="шт", max_length=32, description="Единица измерения (кг, коробка, мешок, шт)")
+    note: Optional[str] = Field(default=None, max_length=500, description="Примечание/пожелание к позиции")
 
 
 class ExtractedOrder(BaseModel):
@@ -126,11 +126,14 @@ class OutboundMessage(BaseModel):
     parse_mode: str = "HTML"
 
 
+ALLOWED_PLATFORMS = {"telegram", "vk", "whatsapp", "viber", "max"}
+
+
 class InboundMessage(BaseModel):
     """Унифицированное входящее сообщение из любого поддерживаемого мессенджера."""
-    platform: str
-    platform_user_id: str
-    chat_id: str
+    platform: str = Field(..., description="Платформа (telegram, vk, whatsapp, viber, max)")
+    platform_user_id: str = Field(..., min_length=1, max_length=128)
+    chat_id: str = Field(..., min_length=1, max_length=128)
     text: Optional[str] = None
     voice_bytes: Optional[bytes] = None
     voice_url: Optional[str] = None
@@ -140,8 +143,47 @@ class InboundMessage(BaseModel):
     @computed_field
     @property
     def session_id(self) -> str:
-        """Глобально уникальный идентификатор сессии клиента."""
-        return f"{self.platform}:{self.platform_user_id}"
+        """Глобально уникальный идентификатор сессии клиента с поддержкой групповых чатов."""
+        plat = self.platform.lower().strip()
+        if plat not in ALLOWED_PLATFORMS:
+            plat = "unknown"
+        # Санитизация ID от разделителей : и управляющих символов для исключения коллизий сессий
+        uid = (self.platform_user_id or "").strip().replace(":", "_")
+        cid = (self.chat_id or "").strip().replace(":", "_")
+        if not uid:
+            uid = "anonymous"
+        # В групповых чатах изолируем сессию по chat_id, чтобы все члены бригады видели общий черновик
+        is_group = bool(cid and cid != uid and (
+            cid.startswith("-") or cid.endswith("@g.us") or (cid.isdigit() and int(cid) > 2000000000)
+        ))
+        if is_group:
+            return f"{plat}:group:{cid}"
+        return f"{plat}:{uid}"
+
+
+def extract_chat_id_from_session(session_id: str) -> str:
+    """
+    Извлекает фактический идентификатор чата (chat_id) из глобального session_id.
+    Корректно обрабатывает групповые сессии:
+    'telegram:group:-100123456789' -> '-100123456789'
+    'whatsapp:group:12036304@g.us' -> '12036304@g.us'
+    'vk:123456' -> '123456'
+    """
+    if not session_id:
+        return ""
+    parts = session_id.split(":")
+    if len(parts) >= 3 and parts[1] == "group":
+        return ":".join(parts[2:])
+    elif len(parts) >= 2:
+        return ":".join(parts[1:])
+    return session_id
+
+
+def extract_platform_from_session(session_id: str) -> str:
+    """Извлекает платформу мессенджера из session_id (по умолчанию 'telegram')."""
+    if not session_id:
+        return "telegram"
+    return session_id.split(":", 1)[0] if ":" in session_id else "telegram"
 
 
 class CartIntentResult(BaseModel):

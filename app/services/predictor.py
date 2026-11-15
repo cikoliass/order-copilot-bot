@@ -1,4 +1,5 @@
 import logging
+import math
 from collections import defaultdict
 from statistics import median
 from typing import Any
@@ -36,7 +37,13 @@ class OrderPredictor:
                 sku = it.get("sku_id") or it.get("sku")
                 if not sku:
                     continue
-                qty = float(it.get("final_quantity") or it.get("qty") or 1.0)
+                try:
+                    raw_q = it.get("final_quantity") if it.get("final_quantity") is not None else it.get("qty")
+                    qty = float(raw_q) if raw_q is not None else 1.0
+                    if qty <= 0 or math.isnan(qty) or math.isinf(qty):
+                        qty = 1.0
+                except (ValueError, TypeError):
+                    qty = 1.0
                 if sku not in seen_skus:
                     sku_stats[sku]["count"] += 1
                     seen_skus.add(sku)
@@ -71,14 +78,43 @@ class OrderPredictor:
             sample = info["last_item"]
             opt_qty = round(median(info["quantities"]), 2)
 
+            is_out_of_stock = False
+            suggested_analog_sku = None
+            suggested_analog_name = None
+            suggested_analog_price = None
+            suggested_analog_unit = None
+            pack_multiple = None
+            suggested_pack_quantity = None
+            pack_warning = None
+            status = MatchStatus.RECOGNIZED
+
             if cat_item:
                 price = cat_item.price
                 unit = cat_item.base_unit
                 name = cat_item.name
+                pack_multiple = cat_item.pack_multiple
+
+                # Проверка наличия на складе для защиты от предложения товаров с нулевым остатком
+                stock = catalog_matcher.get_stock(cat_item)
+                if stock <= 0 or cat_item.sku_id in catalog_matcher._stop_list:
+                    is_out_of_stock = True
+                    status = MatchStatus.OUT_OF_STOCK
+                    analog = catalog_matcher.find_best_analog(cat_item, query=name)
+                    if analog:
+                        suggested_analog_sku = analog.sku_id
+                        suggested_analog_name = analog.name
+                        suggested_analog_price = analog.price
+                        suggested_analog_unit = analog.base_unit
+                elif pack_multiple and pack_multiple > 0 and pack_multiple != 1.0:
+                    ratio = opt_qty / pack_multiple
+                    if not math.isclose(ratio, round(ratio), rel_tol=1e-5, abs_tol=1e-5):
+                        suggested_pack_quantity = float(math.ceil(round(ratio, 6)) * pack_multiple)
+                        pack_warning = f"Кратность: {pack_multiple:g} {unit}"
             else:
                 price = float(sample.get("price") or 0.0)
                 unit = sample.get("base_unit") or sample.get("unit") or "шт"
                 name = sample.get("catalog_name") or sample.get("name") or "Товар"
+                status = MatchStatus.NEEDS_REVIEW
 
             total = round(opt_qty * price, 2)
             freq_percent = int((info["count"] / total_orders) * 100)
@@ -94,9 +130,17 @@ class OrderPredictor:
                     base_unit=unit,
                     price=price,
                     total_sum=total,
-                    confidence=1.0,
-                    status=MatchStatus.RECOGNIZED,
+                    confidence=1.0 if cat_item else 0.5,
+                    status=status,
                     recalculation_hint=f"в {freq_percent}% ваших заказов",
+                    pack_multiple=pack_multiple,
+                    suggested_pack_quantity=suggested_pack_quantity,
+                    pack_warning=pack_warning,
+                    is_out_of_stock=is_out_of_stock,
+                    suggested_analog_sku=suggested_analog_sku,
+                    suggested_analog_name=suggested_analog_name,
+                    suggested_analog_price=suggested_analog_price,
+                    suggested_analog_unit=suggested_analog_unit,
                 )
             )
 
@@ -122,6 +166,8 @@ class OrderPredictor:
 
         missing: list[MatchedItem] = []
         for item in ideal:
+            if item.is_out_of_stock:
+                continue
             if item.sku_id and item.sku_id in current_skus:
                 continue
             if item.catalog_name and item.catalog_name.lower().strip() in current_names:

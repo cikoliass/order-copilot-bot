@@ -1,5 +1,6 @@
 import json
 import logging
+import math
 import re
 from pathlib import Path
 from typing import Any
@@ -64,7 +65,12 @@ def _parse_description_meta(name: str, desc_html: str) -> tuple[list[str], dict[
         elif line_clean.lower().startswith("фасовка"):
             matches = re.findall(r"1\s*([а-яА-Яa-zA-Z/]+)\s*=\s*(\d+(?:[\.,]\d+)?)", line_clean)
             for unit_raw, val_str in matches:
-                val = float(val_str.replace(",", "."))
+                try:
+                    val = float(val_str.replace(",", "."))
+                    if val <= 0 or math.isnan(val) or math.isinf(val):
+                        continue
+                except (ValueError, TypeError):
+                    continue
                 for sub_u in unit_raw.lower().split("/"):
                     short_u = UNIT_MAP.get(sub_u.strip(), sub_u.strip()[:3])
                     conversions[short_u] = val
@@ -106,7 +112,10 @@ async def sync_catalog_from_bitrix() -> list[dict[str, Any]]:
     products_b24 = []
     async with httpx.AsyncClient(timeout=settings.BITRIX_TIMEOUT_SEC) as client:
         start = 0
-        while True:
+        pages = 0
+        max_pages = 100  # До 5000 товаров, защита от бесконечного цикла
+        while pages < max_pages:
+            pages += 1
             payload["start"] = start
             try:
                 resp = await client.post(url, json=payload)
@@ -115,8 +124,9 @@ async def sync_catalog_from_bitrix() -> list[dict[str, Any]]:
                     break
                 data = resp.json()
                 products_b24.extend(data.get("result", []))
-                if "next" in data:
-                    start = data["next"]
+                next_start = data.get("next")
+                if next_start is not None and str(next_start).isdigit() and int(next_start) > start:
+                    start = int(next_start)
                 else:
                     break
             except Exception as exc:
@@ -132,7 +142,12 @@ async def sync_catalog_from_bitrix() -> list[dict[str, Any]]:
         b24_id = p.get("ID")
         name = (p.get("NAME") or "Товар").strip()
         raw_price = p.get("PRICE")
-        price = float(raw_price) if raw_price is not None and str(raw_price).strip() != "" else 0.0
+        try:
+            price = max(0.0, float(raw_price)) if raw_price is not None and str(raw_price).strip() != "" else 0.0
+            if math.isnan(price) or math.isinf(price):
+                price = 0.0
+        except (ValueError, TypeError):
+            price = 0.0
         sku_code = f"B24-{b24_id}"
 
         aliases, conversions = _parse_description_meta(name, p.get("DESCRIPTION", ""))
@@ -151,7 +166,7 @@ async def sync_catalog_from_bitrix() -> list[dict[str, Any]]:
         catalog_items.append({
             "sku_id": sku_code,
             "sku": sku_code,
-            "bitrix_product_id": int(b24_id),
+            "bitrix_product_id": int(b24_id) if str(b24_id).isdigit() else 0,
             "name": name,
             "catalog_name": name,
             "price": price,

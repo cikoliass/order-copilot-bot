@@ -3,12 +3,15 @@ import hashlib
 import html
 import json
 import logging
+import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 import httpx
 from pydantic import BaseModel
 from app.core.config import settings
 from app.core.database import (
+    claim_outbox_entries,
     create_outbox_entry,
     get_pending_outbox_entries,
     mark_outbox_failure,
@@ -16,7 +19,12 @@ from app.core.database import (
     update_order_doc_number,
 )
 from app.services.dispatcher import dispatcher
-from app.services.schemas import MatchedItem, OutboundMessage
+from app.services.schemas import (
+    MatchedItem,
+    OutboundMessage,
+    extract_chat_id_from_session,
+    extract_platform_from_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +33,10 @@ def resolve_delivery_date(raw_date: Optional[str]) -> str:
     """Преобразует относительные даты («на завтра», «сегодня») в фиксированную дату с днем недели."""
     if not raw_date:
         return "Как можно скорее"
+
+    import re
+    if re.search(r"\(\d{2}\.\d{2}\.\d{4}\)", raw_date):
+        return raw_date
 
     lower = raw_date.lower().strip()
     now = datetime.now()
@@ -109,7 +121,7 @@ class IntegrationsService:
         for it in items:
             sku, name, unit = it.get("sku_id", "SKU-000"), it.get("name", "Товар"), it.get("unit", "шт")
             qty, price = float(it.get("qty", 1.0)), float(it.get("price", 0.0))
-            lines_text.append(f"• [{sku}] <b>{name}</b>: {qty:g} {unit} × {price:g} ₽ = {qty * price:,.2f} ₽")
+            lines_text.append(f"• [{html.escape(str(sku))}] <b>{html.escape(str(name))}</b>: {qty:g} {html.escape(str(unit))} × {price:g} ₽ = {qty * price:,.2f} ₽")
 
             row_data: dict[str, Any] = {"PRODUCT_NAME": f"[{sku}] {name}", "PRICE": price, "QUANTITY": qty}
             if str(sku).startswith("B24-") and str(sku).split("-")[-1].isdigit():
@@ -117,8 +129,8 @@ class IntegrationsService:
             product_rows.append(row_data)
 
         comments = (
-            f"<b>Клиент (ID/Канал):</b> {client_id}<br>"
-            f"<b>Дата доставки:</b> {delivery_date or 'Как можно скорее'}<br><br>"
+            f"<b>Клиент (ID/Канал):</b> {html.escape(str(client_id))}<br>"
+            f"<b>Дата доставки:</b> {html.escape(str(delivery_date or 'Как можно скорее'))}<br><br>"
             f"<b>Состав заказа:</b><br>" + "<br>".join(lines_text)
         )
         deal_payload = {
@@ -162,7 +174,7 @@ class IntegrationsService:
         docs = list(completed_docs or [])
         errors = []
 
-        if not any("ЗК-" in str(d) for d in docs):
+        if not any(not str(d).startswith("Б24-") for d in docs):
             try:
                 doc_1c = await self._send_to_1c(client_id, items, delivery_date, idempotency_key=idempotency_key)
                 docs.append(doc_1c)
@@ -193,6 +205,8 @@ class IntegrationsService:
     ) -> IntegrationResult:
         """Единая точка выгрузки подтвержденного заказа с Outbox-фоллбэком."""
         resolved_date = resolve_delivery_date(delivery_date)
+        clean_date = (resolved_date or "Как можно скорее")[:100]
+        clean_client_id = re.sub(r"[\r\n\t]+", " ", str(session_id))[:128].strip()
         items_1c = [
             {
                 "sku_id": it.sku_id or "SKU-000",
@@ -204,14 +218,16 @@ class IntegrationsService:
             for it in valid_items
         ]
         total_amount = sum(it.total_sum for it in valid_items)
-        client_id = session_id
+        client_id = clean_client_id
 
-        # Формируем уникальный ключ идемпотентности по хэшу состава заказа и времени
-        items_fingerprint = f"{session_id}:{resolved_date}:{[(i['sku_id'], i['qty']) for i in items_1c]}"
+        # Формируем уникальный ключ идемпотентности: включаем order_id, чтобы два разных заказа
+        # одного клиента с одинаковым составом на один день не слипались в 1С
+        unique_token = f"order-{order_id}" if order_id is not None else f"sess-{clean_client_id}"
+        items_fingerprint = f"{unique_token}:{clean_client_id}:{clean_date}:{[(i['sku_id'], i['qty']) for i in items_1c]}"
         idempotency_key = f"order-{hashlib.sha256(items_fingerprint.encode()).hexdigest()[:16]}"
 
         doc_numbers, errors = await self._dispatch_destinations(
-            client_id, items_1c, resolved_date, total_amount, idempotency_key=idempotency_key
+            client_id, items_1c, clean_date, total_amount, idempotency_key=idempotency_key
         )
         if doc_numbers and not errors:
             return IntegrationResult(
@@ -263,60 +279,78 @@ integrations_service = IntegrationsService()
 
 
 async def run_outbox_worker() -> None:
-    """Фоновый воркер Outbox Pattern с сохранением completed_docs и уведомлением клиента."""
+    """Фоновый воркер Outbox Pattern с сохранением completed_docs, защитой от split-brain и уведомлением клиента."""
     logger.info("Outbox воркер успешно запущен с интервалом %d сек.", settings.OUTBOX_POLL_INTERVAL_SEC)
+    from app.core.redis_client import redis_client
+
     while True:
         try:
             await asyncio.sleep(settings.OUTBOX_POLL_INTERVAL_SEC)
-            entries = await get_pending_outbox_entries(limit=20)
-            if not entries:
+            # Защита от одновременной обработки несколькими инстансами через Redis Distributed Lock
+            lock_token = str(uuid.uuid4())
+            acquired = await redis_client.acquire_lock("outbox_worker_leader", timeout=max(10, settings.OUTBOX_POLL_INTERVAL_SEC - 5), lock_token=lock_token)
+            if not acquired:
                 continue
 
-            logger.info("Outbox воркер обрабатывает %d зависших заказов...", len(entries))
-            for entry in entries:
-                payload = json.loads(entry.payload_json)
-                client_id = payload.get("client_id", entry.session_id)
-                items = payload.get("items", [])
-                delivery_date = payload.get("delivery_date")
-                total_amount = float(payload.get("total_amount", 0.0))
-                completed_docs = payload.get("completed_docs", [])
-                idempotency_key = payload.get("idempotency_key")
+            try:
+                entries = await claim_outbox_entries(limit=20)
+                if not entries:
+                    continue
 
-                docs, errors = await integrations_service._dispatch_destinations(
-                    client_id, items, delivery_date, total_amount, completed_docs, idempotency_key=idempotency_key
-                )
-                payload["completed_docs"] = docs
+                logger.info("Outbox воркер обрабатывает %d зависших заказов...", len(entries))
+                for entry in entries:
+                    try:
+                        payload = json.loads(entry.payload_json)
+                        client_id = payload.get("client_id", entry.session_id)
+                        items = payload.get("items", [])
+                        delivery_date = payload.get("delivery_date")
+                        total_amount = float(payload.get("total_amount", 0.0))
+                        completed_docs = payload.get("completed_docs", [])
+                        idempotency_key = payload.get("idempotency_key")
 
-                if not errors:
-                    await mark_outbox_success(entry.id)
-                    final_doc_num = " / ".join(docs)
-                    logger.info("Outbox entry %d успешно отправлен: %s", entry.id, final_doc_num)
+                        docs, errors = await integrations_service._dispatch_destinations(
+                            client_id, items, delivery_date, total_amount, completed_docs, idempotency_key=idempotency_key
+                        )
+                        payload["completed_docs"] = docs
 
-                    # Обновляем OrderRecord в БД
-                    order_id = payload.get("order_id") or entry.order_id
-                    if order_id:
+                        if not errors:
+                            await mark_outbox_success(entry.id)
+                            final_doc_num = " / ".join(docs)
+                            logger.info("Outbox entry %d успешно отправлен: %s", entry.id, final_doc_num)
+
+                            # Обновляем OrderRecord в БД
+                            order_id = payload.get("order_id") or entry.order_id
+                            if order_id:
+                                try:
+                                    await update_order_doc_number(order_id, final_doc_num, "Заказ успешно создан (1С + Битрикс24)")
+                                except Exception as upd_err:
+                                    logger.warning("Не удалось обновить OrderRecord #%s: %s", order_id, upd_err)
+
+                            # Уведомляем клиента об успешной доставке
+                            platform = payload.get("platform") or extract_platform_from_session(entry.session_id)
+                            chat_id = payload.get("chat_id") or extract_chat_id_from_session(entry.session_id)
+                            if platform and chat_id:
+                                try:
+                                    text_notify = (
+                                        f"📦 <b>Заказ из очереди успешно зарегистрирован в 1С!</b>\n\n"
+                                        f"📄 <b>Номер документа:</b> <code>{html.escape(final_doc_num)}</code>\n"
+                                        f"💰 <b>Сумма:</b> {total_amount:,.2f} ₽\n"
+                                        f"📅 <b>Дата доставки:</b> {html.escape(delivery_date or 'По регламенту')}"
+                                    )
+                                    await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=text_notify))
+                                except Exception as notify_err:
+                                    logger.warning("Не удалось отправить клиенту уведомление об Outbox: %s", notify_err)
+                        else:
+                            # Важно: сохраняем обновленный payload с completed_docs, чтобы не дублировать 1С при следующей попытке!
+                            await mark_outbox_failure(entry.id, "; ".join(errors), updated_payload=payload)
+                    except Exception as entry_err:
+                        logger.error("Сбой обработки Outbox entry #%d: %s", entry.id, entry_err)
                         try:
-                            await update_order_doc_number(order_id, final_doc_num, "Заказ успешно создан (1С + Битрикс24)")
-                        except Exception as upd_err:
-                            logger.warning("Не удалось обновить OrderRecord #%s: %s", order_id, upd_err)
-
-                    # Уведомляем клиента об успешной доставке
-                    platform = payload.get("platform") or (entry.session_id.split(":", 1)[0] if ":" in entry.session_id else "telegram")
-                    chat_id = payload.get("chat_id") or (entry.session_id.split(":", 1)[1] if ":" in entry.session_id else entry.session_id)
-                    if platform and chat_id:
-                        try:
-                            text_notify = (
-                                f"📦 <b>Заказ из очереди успешно зарегистрирован в 1С!</b>\n\n"
-                                f"📄 <b>Номер документа:</b> <code>{html.escape(final_doc_num)}</code>\n"
-                                f"💰 <b>Сумма:</b> {total_amount:,.2f} ₽\n"
-                                f"📅 <b>Дата доставки:</b> {html.escape(delivery_date or 'По регламенту')}"
-                            )
-                            await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=text_notify))
-                        except Exception as notify_err:
-                            logger.warning("Не удалось отправить клиенту уведомление об Outbox: %s", notify_err)
-                else:
-                    # Важно: сохраняем обновленный payload с completed_docs, чтобы не дублировать 1С при следующей попытке!
-                    await mark_outbox_failure(entry.id, "; ".join(errors), updated_payload=payload)
+                            await mark_outbox_failure(entry.id, f"Ошибка обработки записи: {entry_err}")
+                        except Exception as fatal_err:
+                            logger.critical("Не удалось зафиксировать сбой Outbox #%d: %s", entry.id, fatal_err)
+            finally:
+                await redis_client.release_lock("outbox_worker_leader", lock_token=lock_token)
         except asyncio.CancelledError:
             logger.info("Outbox воркер остановлен.")
             break

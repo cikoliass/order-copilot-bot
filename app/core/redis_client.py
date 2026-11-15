@@ -138,7 +138,7 @@ class RedisClient:
                 self._in_memory_locks.pop(lock_key, None)
 
     async def set_order_draft(self, session_id: str, data: dict, ttl: int = 86400) -> None:
-        """Сохранение черновика заказа сессии в Redis."""
+        """Сохранение черновика заказа сессии в Redis с защитой от переполнения памяти."""
         await self._try_reconnect()
         key = f"order:draft:{session_id}"
         serialized = json.dumps(data, ensure_ascii=False)
@@ -149,7 +149,19 @@ class RedisClient:
             except Exception as exc:
                 logger.warning("Сбой Redis при сохранении черновика: %s", exc)
 
-        self._in_memory_fallback[key] = (serialized, time.time() + ttl)
+        now = time.time()
+        self._in_memory_fallback[key] = (serialized, now + ttl)
+        # Очистка устаревших черновиков для защиты от OOM/DoS
+        if len(self._in_memory_fallback) > 5000:
+            expired_keys = [
+                k for k, v in self._in_memory_fallback.items()
+                if isinstance(v, tuple) and len(v) == 2 and isinstance(v[1], (int, float)) and v[1] < now
+            ]
+            for ek in expired_keys[:1000]:
+                self._in_memory_fallback.pop(ek, None)
+            if len(self._in_memory_fallback) > 5000:
+                for old_k in list(self._in_memory_fallback.keys())[:500]:
+                    self._in_memory_fallback.pop(old_k, None)
 
     async def get_order_draft(self, session_id: str) -> Optional[dict]:
         """Получение сохраненного черновика заказа."""
@@ -244,6 +256,40 @@ class RedisClient:
                 pass
         res = self._in_memory_fallback.get(key)
         return dict(res) if isinstance(res, dict) else {}
+
+    async def check_rate_limit(self, key: str, max_requests: int = 30, window_sec: int = 60) -> bool:
+        """Rate-limiting по скользящему окну (Sliding Window Log) в Redis / fallback."""
+        await self._try_reconnect()
+        rl_key = f"rate_limit:{key}"
+        now = time.time()
+        if not self._use_fallback and self._redis:
+            try:
+                pipe = self._redis.pipeline()
+                pipe.zremrangebyscore(rl_key, 0, now - window_sec)
+                pipe.zadd(rl_key, {f"{now}:{uuid.uuid4().hex[:8]}": now})
+                pipe.zcard(rl_key)
+                pipe.expire(rl_key, window_sec)
+                results = await pipe.execute()
+                count = results[2]
+                return count <= max_requests
+            except Exception as exc:
+                logger.warning("Сбой Redis при проверке rate limit: %s", exc)
+
+        bucket = self._in_memory_fallback.setdefault(rl_key, [])
+        if isinstance(bucket, list):
+            self._in_memory_fallback[rl_key] = [ts for ts in bucket if ts > now - window_sec]
+            self._in_memory_fallback[rl_key].append(now)
+            allowed = len(self._in_memory_fallback[rl_key]) <= max_requests
+            # Защита от утечки памяти: периодическая очистка протухших ключей rate_limit
+            if len(self._in_memory_fallback) > 5000:
+                stale_keys = [
+                    k for k, v in self._in_memory_fallback.items()
+                    if k.startswith("rate_limit:") and isinstance(v, list) and (not v or v[-1] <= now - window_sec)
+                ]
+                for sk in stale_keys[:1000]:
+                    self._in_memory_fallback.pop(sk, None)
+            return allowed
+        return True
 
 
 redis_client = RedisClient(settings.REDIS_URL)

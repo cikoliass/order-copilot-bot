@@ -5,7 +5,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Any
 import httpx
-from fastapi import FastAPI, status, Request, Response
+from fastapi import FastAPI, HTTPException, status, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.gateway import process_inbound_core, router as gateway_router
 from app.core.config import settings
@@ -96,7 +96,15 @@ async def _run_vk_polling_bridge(token: str) -> None:
                                 except Exception:
                                     pass
                             raw_p = obj.get("payload", {})
-                            action = (json.loads(raw_p) if isinstance(raw_p, str) else raw_p).get("action") if isinstance(raw_p, (dict, str)) else None
+                            action = None
+                            if isinstance(raw_p, str):
+                                try:
+                                    parsed_p = json.loads(raw_p)
+                                    action = parsed_p.get("action") if isinstance(parsed_p, dict) else str(parsed_p)
+                                except Exception:
+                                    action = raw_p
+                            elif isinstance(raw_p, dict):
+                                action = raw_p.get("action")
                             asyncio.create_task(process_inbound_core(InboundMessage(
                                 platform="vk", platform_user_id=uid, chat_id=peer_id, callback_data=action
                             )))
@@ -238,6 +246,9 @@ async def _run_whatsapp_polling_bridge(instance_id: str, token: str) -> None:
 
                             await asyncio.sleep(0.2)
                             continue
+                    elif resp.status_code != 200:
+                        logger.warning("WhatsApp receiveNotification вернул HTTP %d: %s", resp.status_code, resp.text[:200])
+                        await asyncio.sleep(3.0)
 
                     await asyncio.sleep(2.0)
                 except asyncio.CancelledError:
@@ -299,6 +310,9 @@ async def _run_max_polling_bridge(token: str) -> None:
                                         pass
                                 if uid and (payload := cb.get("payload")):
                                     asyncio.create_task(process_inbound_core(InboundMessage(platform="max", platform_user_id=uid, chat_id=chat_id, callback_data=str(payload))))
+                    else:
+                        logger.warning("MAX polling /updates вернул HTTP %d: %s", resp.status_code, resp.text[:200])
+                        await asyncio.sleep(3.0)
 
                     await asyncio.sleep(0.5)
                 except asyncio.CancelledError:
@@ -380,6 +394,11 @@ async def lifespan(app: FastAPI):
 
     await redis_client.close()
     await engine.dispose()
+    try:
+        from app.services.dispatcher import close_dispatcher_sessions
+        await close_dispatcher_sessions()
+    except Exception:
+        pass
     logger.info("💤 Все соединения безопасно закрыты.")
 
 
@@ -411,12 +430,14 @@ async def security_headers_middleware(request: Request, call_next):
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["X-XSS-Protection"] = "1; mode=block"
     response.headers["Permissions-Policy"] = "geolocation=(), camera=(), microphone=()"
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     return response
 
 
 @app.middleware("http")
 async def request_body_size_limiter(request: Request, call_next):
-    """Защита от DoS и исчерпания памяти при отправке аномально больших payload."""
+    """Защита от DoS и исчерпания памяти при отправке аномально больших payload (включая chunked transfer)."""
     max_bytes = settings.MAX_REQUEST_BODY_SIZE_MB * 1024 * 1024
     content_length = request.headers.get("content-length")
     if content_length:
@@ -429,7 +450,34 @@ async def request_body_size_limiter(request: Request, call_next):
                 )
         except ValueError:
             pass
-    return await call_next(request)
+
+    # Защита от потокового/chunked исчерпания памяти без Content-Length
+    received_bytes = 0
+    original_receive = request._receive
+
+    async def limited_receive():
+        nonlocal received_bytes
+        msg = await original_receive()
+        if msg.get("type") == "http.request":
+            received_bytes += len(msg.get("body", b""))
+            if received_bytes > max_bytes:
+                raise HTTPException(
+                    status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                    detail=f"Payload Too Large: streaming body exceeds {settings.MAX_REQUEST_BODY_SIZE_MB}MB limit",
+                )
+        return msg
+
+    request._receive = limited_receive
+    try:
+        return await call_next(request)
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_413_CONTENT_TOO_LARGE:
+            return Response(
+                content=json.dumps({"detail": exc.detail}),
+                status_code=status.HTTP_413_CONTENT_TOO_LARGE,
+                media_type="application/json",
+            )
+        raise
 
 
 app.include_router(gateway_router)

@@ -18,6 +18,22 @@ class Settings(BaseSettings):
     APP_PORT: int = Field(default=8001, description="Порт входящего шлюза FastAPI")
     APP_HOST: str = Field(default="127.0.0.1", description="Хост входящего шлюза FastAPI")
     WEBHOOK_SECRET: str = Field(default="super_secret_webhook_salt_123", description="Секретный ключ вебхуков")
+    ADMIN_USER_IDS: list[str] = Field(
+        default_factory=lambda: ["admin", "telegram:admin", "telegram:999111"],
+        description="Белый список ID администраторов для сервисных команд (/sync)",
+    )
+    REQUIRE_CLIENT_AUTH: bool = Field(
+        default=False,
+        description="Требовать ли обязательную привязку аккаунта мессенджера к B2B-контрагенту перед заказом",
+    )
+    MAX_TEXT_LENGTH: int = Field(
+        default=3000,
+        description="Максимальная длина текста входящего заказа (защита от DoS и слива LLM-токенов)",
+    )
+    RATE_LIMIT_PER_MINUTE: int = Field(
+        default=30,
+        description="Максимальное количество входящих сообщений в минуту на одного пользователя",
+    )
     ALLOWED_ORIGINS: list[str] = Field(
         default_factory=lambda: ["*"],
         description="Список разрешенных CORS origins",

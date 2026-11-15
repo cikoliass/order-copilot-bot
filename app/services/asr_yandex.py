@@ -10,6 +10,17 @@ logger = logging.getLogger(__name__)
 MAX_AUDIO_BYTES = 20 * 1024 * 1024  # 20 МБ лимит для защиты от OOM и DoS
 
 
+def detect_audio_format(audio_bytes: bytes) -> str:
+    """Определение формата аудиофайла по сигнатурам байт (magic bytes)."""
+    if audio_bytes.startswith(b"OggS"):
+        return "oggopus"
+    if audio_bytes.startswith(b"ID3") or (len(audio_bytes) > 2 and audio_bytes[0] == 0xFF and (audio_bytes[1] & 0xE0) == 0xE0):
+        return "mp3"
+    if audio_bytes.startswith(b"RIFF") and len(audio_bytes) > 12 and audio_bytes[8:12] == b"WAVE":
+        return "lpcm"
+    return "unknown"
+
+
 def _convert_audio_with_ffmpeg(audio_bytes: bytes) -> tuple[bytes, str]:
     """
     Синхронная конвертация любого аудио/видео (включая video_note из Telegram)
@@ -17,13 +28,14 @@ def _convert_audio_with_ffmpeg(audio_bytes: bytes) -> tuple[bytes, str]:
     Флаг -vn отсекает видеопоток, извлекая только чистый звук.
     Таймаут 15 секунд предотвращает зависание процесса.
     """
+    detected = detect_audio_format(audio_bytes)
     proc = None
     try:
         proc = subprocess.Popen(
             [
                 "ffmpeg", "-y",
                 "-nostdin",
-                "-protocol_whitelist", "pipe,file",
+                "-protocol_whitelist", "pipe",
                 "-i", "pipe:0",
                 "-vn",
                 "-c:a", "libopus",
@@ -45,8 +57,8 @@ def _convert_audio_with_ffmpeg(audio_bytes: bytes) -> tuple[bytes, str]:
             proc.kill()
         logger.error("Таймаут ffmpeg при конвертации аудио (более 15 сек).")
     except Exception as conv_err:
-        logger.warning("Ошибка вызова ffmpeg: %s", conv_err)
-    return audio_bytes, "oggopus"
+        logger.warning("Ошибка вызова ffmpeg (%s). Используем исходный формат: %s", conv_err, detected)
+    return audio_bytes, (detected if detected != "unknown" else "oggopus")
 
 
 async def transcribe_voice_yandex(
@@ -74,11 +86,14 @@ async def transcribe_voice_yandex(
         logger.warning("YANDEX_API_KEY не задан или тестовый режим. Распознавание речи недоступно.")
         return ""
 
-    # Автоопределение формата: если не OGG Opus, конвертируем в отдельном потоке
-    if not audio_bytes.startswith(b"OggS"):
-        audio_bytes, audio_format = await asyncio.to_thread(_convert_audio_with_ffmpeg, audio_bytes)
+    # Автоопределение формата: если аудио уже в поддерживаемом формате (OGG Opus или MP3),
+    # отправляем напрямую в SpeechKit без накладных расходов на ffmpeg
+    detected = detect_audio_format(audio_bytes)
+    if detected in ("oggopus", "mp3"):
+        audio_format = detected
     else:
-        audio_format = "oggopus"
+        # Для видео-кружочков (mp4), webm, m4a конвертируем в OGG Opus
+        audio_bytes, audio_format = await asyncio.to_thread(_convert_audio_with_ffmpeg, audio_bytes)
 
     headers = {
         "Authorization": f"Api-Key {api_key}",

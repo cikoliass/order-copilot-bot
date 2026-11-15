@@ -305,4 +305,4 @@ async def view_orders_journal():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("mock_server.main:app", host="0.0.0.0", port=8080, reload=False)
+    uvicorn.run("mock_server.main:app", host="127.0.0.1", port=8080, reload=False)
