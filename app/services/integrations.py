@@ -121,6 +121,7 @@ class IntegrationsService:
         items: list[dict[str, Any]],
         delivery_date: str | None,
         total_amount: float,
+        existing_deal_id: int | None = None,
     ) -> str:
         """Отправка заказа в CRM Битрикс24 (Создание сделки crm.deal.add + привязка товаров)."""
         webhook_url = settings.BITRIX_WEBHOOK_URL
@@ -154,22 +155,28 @@ class IntegrationsService:
         }
 
         async with httpx.AsyncClient(timeout=settings.BITRIX_TIMEOUT_SEC) as client:
-            add_url = f"{webhook_url.rstrip('/')}/crm.deal.add.json"
-            deal_resp = await asyncio.wait_for(
-                client.post(add_url, json=deal_payload),
-                timeout=settings.BITRIX_TIMEOUT_SEC,
-            )
-            deal_data = deal_resp.json()
-            deal_id = deal_data.get("result")
+            deal_id = existing_deal_id
             if not deal_id:
-                raise RuntimeError(f"Ошибка создания сделки Битрикс24: {deal_data.get('error_description') or deal_data}")
+                add_url = f"{webhook_url.rstrip('/')}/crm.deal.add.json"
+                deal_resp = await asyncio.wait_for(
+                    client.post(add_url, json=deal_payload),
+                    timeout=settings.BITRIX_TIMEOUT_SEC,
+                )
+                if deal_resp.status_code not in (200, 201):
+                    raise RuntimeError(f"Битрикс24 crm.deal.add вернул HTTP {deal_resp.status_code}")
+                deal_data = deal_resp.json()
+                deal_id = deal_data.get("result")
+                if not deal_id:
+                    raise RuntimeError(f"Ошибка создания сделки Битрикс24: {deal_data.get('error_description') or deal_data}")
 
             if product_rows:
                 rows_url = f"{webhook_url.rstrip('/')}/crm.deal.productrows.set.json"
-                await asyncio.wait_for(
+                rows_resp = await asyncio.wait_for(
                     client.post(rows_url, json={"id": deal_id, "rows": product_rows}),
                     timeout=settings.BITRIX_TIMEOUT_SEC,
                 )
+                if rows_resp.status_code not in (200, 201) or "error" in rows_resp.json():
+                    raise RuntimeError(f"Ошибка привязки товаров к сделке Б24-{deal_id}: {rows_resp.text}")
 
             return f"Б24-{deal_id}"
 

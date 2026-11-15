@@ -12,8 +12,8 @@ services:
     environment:
       - APP_PORT=8001
       - APP_HOST=0.0.0.0
-      - REDIS_URL=redis://:redis_secure_pass_123@redis:6379/0
-      - DATABASE_URL=postgresql+asyncpg://copilot:copilot_pass@db:5432/orders_enterprise
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-changeme_redis_pass}@redis:6379/0
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-copilot}:${POSTGRES_PASSWORD:-changeme_pg_pass}@db:5432/${POSTGRES_DB:-orders_enterprise}
       - MOCK_1C_URL=http://mock-1c:8080/api/v1/mock-1c/orders
     depends_on:
       - redis
@@ -32,7 +32,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: order_copilot_redis
-    command: ["redis-server", "--requirepass", "redis_secure_pass_123"]
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:-changeme_redis_pass}", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
     # Порт закрыт внутри docker-сети для изоляции
     expose:
       - "6379"
@@ -42,9 +42,9 @@ services:
     image: postgres:16-alpine
     container_name: order_copilot_postgres
     environment:
-      POSTGRES_DB: orders_enterprise
-      POSTGRES_USER: copilot
-      POSTGRES_PASSWORD: copilot_pass
+      POSTGRES_DB: ${POSTGRES_DB:-orders_enterprise}
+      POSTGRES_USER: ${POSTGRES_USER:-copilot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme_pg_pass}
     # Порт закрыт внутри docker-сети для безопасности
     expose:
       - "5432"

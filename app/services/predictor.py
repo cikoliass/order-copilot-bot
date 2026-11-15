@@ -99,7 +99,7 @@ class OrderPredictor:
                 if stock <= 0 or cat_item.sku_id in catalog_matcher._stop_list:
                     is_out_of_stock = True
                     status = MatchStatus.OUT_OF_STOCK
-                    analog = catalog_matcher.find_best_analog(cat_item, query=name)
+                    analog = await catalog_matcher.find_best_analog_async(cat_item, query=name)
                     if analog:
                         suggested_analog_sku = analog.sku_id
                         suggested_analog_name = analog.name

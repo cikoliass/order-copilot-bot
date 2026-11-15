@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from fastapi import FastAPI, status
 from fastapi.responses import HTMLResponse, RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | 1C-MOCK | %(message)s")
 logger = logging.getLogger("mock_1c")
@@ -22,18 +22,22 @@ IDEMPOTENCY_STORE: dict[str, dict[str, Any]] = {}
 
 
 class Mock1COrderItem(BaseModel):
-    sku_id: str = Field(..., description="Идентификатор номенклатуры в 1С")
-    qty: float = Field(..., gt=0, description="Количество в базовых единицах")
-    unit: str = Field(default="шт", description="Базовая единица измерения")
-    price: float = Field(..., ge=0, description="Цена за единицу в рублях")
-    name: Optional[str] = Field(default=None, description="Наименование номенклатуры")
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    sku_id: str = Field(..., min_length=1, max_length=128, description="Идентификатор номенклатуры в 1С")
+    qty: float = Field(..., gt=0, le=50000.0, description="Количество в базовых единицах")
+    unit: str = Field(default="шт", max_length=32, description="Базовая единица измерения")
+    price: float = Field(..., ge=0, le=10000000.0, description="Цена за единицу в рублях")
+    name: Optional[str] = Field(default=None, max_length=255, description="Наименование номенклатуры")
 
 
 class Mock1COrderRequest(BaseModel):
-    client_id: str = Field(..., description="ID контрагента / сессии")
-    delivery_date: Optional[str] = Field(default=None, description="Дата отгрузки / доставки")
-    items: list[Mock1COrderItem] = Field(..., min_length=1, description="Спецификация товаров")
-    idempotency_key: Optional[str] = Field(default=None, description="Ключ идемпотентности")
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    client_id: str = Field(..., min_length=1, max_length=128, description="ID контрагента / сессии")
+    delivery_date: Optional[str] = Field(default=None, max_length=128, description="Дата отгрузки / доставки")
+    items: list[Mock1COrderItem] = Field(..., min_length=1, max_length=100, description="Спецификация товаров")
+    idempotency_key: Optional[str] = Field(default=None, max_length=128, description="Ключ идемпотентности")
 
 
 class Mock1COrderResponse(BaseModel):

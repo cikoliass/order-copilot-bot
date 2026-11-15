@@ -41,12 +41,15 @@ from sqlalchemy import select
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/webhook", tags=["Webhooks"])
 
+from contextlib import asynccontextmanager
+
 # Менеджер распределенных блокировок сессий с защитой от утечек памяти (bounded cache)
 class SessionLockManager:
-    """Ограниченный пул блокировок сессий с LRU-вытеснением, предотвращающий рост памяти."""
+    """Потокобезопасный пул блокировок сессий с подсчетом ссылок и защитой от гонок при вытеснении."""
     def __init__(self, maxsize: int = 5000):
         from collections import OrderedDict
         self._locks: OrderedDict[str, asyncio.Lock] = OrderedDict()
+        self._refs: dict[str, int] = defaultdict(int)
         self._maxsize = maxsize
 
     def get_lock(self, session_id: str) -> asyncio.Lock:
@@ -55,15 +58,26 @@ class SessionLockManager:
             return self._locks[session_id]
 
         if len(self._locks) >= self._maxsize:
-            # Ищем и удаляем разблокированные устаревшие блокировки с начала
-            for k in list(self._locks.keys())[:100]:
-                if not self._locks[k].locked():
-                    del self._locks[k]
+            for k in list(self._locks.keys()):
+                if not self._locks[k].locked() and self._refs.get(k, 0) == 0:
+                    self._locks.pop(k, None)
+                    self._refs.pop(k, None)
                     if len(self._locks) < self._maxsize:
                         break
+
         lock = asyncio.Lock()
         self._locks[session_id] = lock
         return lock
+
+    @asynccontextmanager
+    async def session_context(self, session_id: str):
+        lock = self.get_lock(session_id)
+        self._refs[session_id] += 1
+        try:
+            async with lock:
+                yield
+        finally:
+            self._refs[session_id] = max(0, self._refs[session_id] - 1)
 
     def __getitem__(self, session_id: str) -> asyncio.Lock:
         return self.get_lock(session_id)
@@ -135,6 +149,15 @@ async def _is_duplicate_update_async(update_key: str) -> bool:
     return await redis_client.check_and_set_dedup(update_key, ttl_sec=300)
 
 
+FORBIDDEN_DEFAULT_SECRETS = frozenset({
+    "",
+    "super_secret_webhook_salt_123",
+    "your_super_secret_webhook_salt_here",
+    "changeme",
+    "secret",
+})
+
+
 def verify_webhook_auth(
     request: Request,
     secret_header_name: Optional[str] = None,
@@ -149,15 +172,13 @@ def verify_webhook_auth(
     if settings.APP_ENV == "test":
         return
 
-    expected = settings.WEBHOOK_SECRET
-    if not expected:
+    expected = (settings.WEBHOOK_SECRET or "").strip()
+    if expected in FORBIDDEN_DEFAULT_SECRETS or (settings.APP_ENV == "production" and len(expected) < 16):
+        logger.critical("Запрос отклонен: WEBHOOK_SECRET не настроен или использует небезопасное дефолтное значение!")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Server configuration error: WEBHOOK_SECRET is not configured",
+            detail="Server security misconfiguration: insecure or missing WEBHOOK_SECRET",
         )
-
-    if settings.APP_ENV == "production" and expected == "super_secret_webhook_salt_123":
-        logger.critical("ВНИМАНИЕ БЕЗОПАСНОСТИ: В production используется дефолтный WEBHOOK_SECRET! Срочно задайте уникальный ключ в .env!")
 
     # 1. Проверяем специализированный заголовок (например, X-Telegram-Bot-Api-Secret-Token)
     if secret_header_name:
@@ -311,7 +332,17 @@ def format_copilot_card(
         lines.append(f"\n💡 Не забудьте заказать: {hints}" if plain else f"\n💡 <i>Забытые товары (из регулярных закупок): {hints}</i>")
 
     lines.append("\n💡 Изменить заказ: «удали 2», «измени 1 на 10 кг» или «добавь 5 кг сахара»." if plain else "\n💡 <i>Чтобы изменить заказ, напишите: «удали 2», «измени 1 на 10 кг» или «добавь 5 кг сахара».</i>")
-    return "\n".join(lines)
+    res_text = "\n".join(lines)
+    if len(res_text) > 3900:
+        res_text = res_text[:3750]
+        if not plain:
+            for tag in ("i", "b", "code"):
+                if res_text.count(f"<{tag}>") > res_text.count(f"</{tag}>"):
+                    res_text += f"</{tag}>"
+            res_text += "\n... <i>[Часть позиций скрыта из-за лимита длины]</i>"
+        else:
+            res_text += "\n... [Часть позиций скрыта из-за лимита длины]"
+    return res_text
 
 
 def get_default_buttons(items_data: Any = 0) -> list[list[OutboundButton]]:
@@ -405,6 +436,9 @@ def _find_cart_item_index(target_name: str, items: list[dict[str, Any]]) -> int:
     return best_idx if best_score >= 50.0 else -1
 
 
+MAX_CART_ITEMS = 50
+
+
 def _merge_items(existing: list[MatchedItem], new_items: list[MatchedItem]) -> list[MatchedItem]:
     for nm in new_items:
         merged = False
@@ -429,7 +463,18 @@ def _merge_items(existing: list[MatchedItem], new_items: list[MatchedItem]) -> l
                             )
                     merged = True
                     break
+        else:
+            # Дедупликация нераспознанных товаров по имени и единице измерения
+            for ex in existing:
+                if not ex.sku_id and ex.raw_name.lower().strip() == nm.raw_name.lower().strip() and ex.raw_unit == nm.raw_unit:
+                    ex.raw_quantity = min(50000.0, round(ex.raw_quantity + nm.raw_quantity, 3))
+                    ex.final_quantity = ex.raw_quantity
+                    merged = True
+                    break
+
         if not merged:
+            if len(existing) >= MAX_CART_ITEMS:
+                break
             existing.append(nm)
     return existing
 
@@ -537,9 +582,22 @@ async def _apply_analog_swap(
     merged = False
     for j, it in enumerate(items):
         if j != target_idx and it.get("sku_id") == new_item.sku_id and it.get("base_unit") == new_item.base_unit:
-            it["final_quantity"] = round(it["final_quantity"] + new_item.final_quantity, 3)
-            it["raw_quantity"] = round(it.get("raw_quantity", 0.0) + new_item.raw_quantity, 3)
+            it["final_quantity"] = min(50000.0, round(it["final_quantity"] + new_item.final_quantity, 3))
+            it["raw_quantity"] = min(50000.0, round(it.get("raw_quantity", 0.0) + new_item.raw_quantity, 3))
             it["total_sum"] = round(it["final_quantity"] * it["price"], 2)
+            pack_mult = it.get("pack_multiple")
+            if pack_mult and pack_mult > 0 and pack_mult != 1.0:
+                ratio = it["final_quantity"] / pack_mult
+                if math.isclose(ratio, round(ratio), rel_tol=1e-5, abs_tol=1e-5):
+                    it["pack_warning"] = None
+                    it["suggested_pack_quantity"] = None
+                else:
+                    sug_q = float(math.ceil(round(ratio, 6)) * pack_mult)
+                    it["suggested_pack_quantity"] = sug_q
+                    it["pack_warning"] = (
+                        f"Отгрузка кратно {pack_mult:g} {it['base_unit']} (у вас {it['final_quantity']:g} {it['base_unit']}). "
+                        f"Округлить до {sug_q:g} {it['base_unit']}?"
+                    )
             items.pop(target_idx)
             merged = True
             break
@@ -656,28 +714,53 @@ async def execute_order_confirmation(
         # Актуализация остатков, стоп-листа и цен по живому каталогу перед отправкой в 1С
         cat_map = {sku.sku_id: sku for sku in catalog_matcher.catalog}
         cart_changed_by_sync = False
+        insufficient_stock_items: list[tuple[MatchedItem, float]] = []
+
         for it in all_items:
-            if it.sku_id and it.sku_id in cat_map:
-                live_sku = cat_map[it.sku_id]
-                live_stock = catalog_matcher.get_stock(live_sku)
-                if live_stock <= 0 or it.sku_id in catalog_matcher._stop_list:
+            if it.sku_id:
+                if cat_map and it.sku_id not in cat_map:
                     it.is_out_of_stock = True
                     it.status = MatchStatus.OUT_OF_STOCK
-                    analog = catalog_matcher.find_best_analog(live_sku, query=it.raw_name)
-                    if analog:
-                        it.suggested_analog_sku = analog.sku_id
-                        it.suggested_analog_name = analog.name
-                        it.suggested_analog_price = analog.price
-                        it.suggested_analog_unit = analog.base_unit
                     cart_changed_by_sync = True
-                if live_sku.price > 0 and not math.isclose(it.price, live_sku.price, rel_tol=1e-4):
-                    it.price = live_sku.price
-                    it.total_sum = round(it.final_quantity * live_sku.price, 2)
-                    cart_changed_by_sync = True
+                    continue
+
+                if it.sku_id in cat_map:
+                    live_sku = cat_map[it.sku_id]
+                    live_stock = catalog_matcher.get_stock(live_sku)
+                    if live_stock <= 0 or it.sku_id in catalog_matcher._stop_list:
+                        it.is_out_of_stock = True
+                        it.status = MatchStatus.OUT_OF_STOCK
+                        analog = await catalog_matcher.find_best_analog_async(live_sku, query=it.raw_name)
+                        if analog:
+                            it.suggested_analog_sku = analog.sku_id
+                            it.suggested_analog_name = analog.name
+                            it.suggested_analog_price = analog.price
+                            it.suggested_analog_unit = analog.base_unit
+                        cart_changed_by_sync = True
+                    elif it.final_quantity > live_stock:
+                        insufficient_stock_items.append((it, live_stock))
+
+                    if not math.isclose(it.price, live_sku.price, rel_tol=1e-4):
+                        it.price = max(0.0, live_sku.price)
+                        it.total_sum = round(it.final_quantity * it.price, 2)
+                        cart_changed_by_sync = True
 
         if cart_changed_by_sync:
             draft["matched_items"] = [it.model_dump() for it in all_items]
             await redis_client.set_order_draft(session_id, draft)
+
+        if insufficient_stock_items:
+            details = ", ".join(
+                f"«{it.catalog_name or it.raw_name}» (запрошено {it.final_quantity:g}, доступно {avail:g} {it.base_unit})"
+                for it, avail in insufficient_stock_items
+            )
+            msg = (
+                f"🚫 <b>Недостаточно товара на складе!</b>\n\n"
+                f"Превышен доступный остаток: <b>{html.escape(details)}</b>.\n\n"
+                f"<i>Уменьшите количество позиций перед подтверждением заказа.</i>"
+            )
+            await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg, buttons=get_default_buttons(all_items)))
+            return
 
         # 1. Блокировка: товары отсутствуют на складе
         oos_items = [it for it in all_items if it.status == MatchStatus.OUT_OF_STOCK or it.is_out_of_stock]
@@ -1000,10 +1083,14 @@ ALLOWED_MEDIA_SUFFIXES = (
 def _is_safe_url_for_download(url: str) -> bool:
     """Строгая проверка URL: только HTTPS, только доверенные CDN мессенджеров и безопасные IP."""
     try:
+        if len(url) > 2048:
+            return False
         parsed = urllib.parse.urlparse(url)
         if parsed.scheme != "https":
             return False
         if parsed.username or parsed.password:
+            return False
+        if parsed.fragment:
             return False
 
         hostname = (parsed.hostname or "").strip().lower()
@@ -1049,20 +1136,31 @@ async def _download_audio(url: str) -> bytes | None:
             headers["Authorization"] = settings.MAX_BOT_TOKEN
 
         max_bytes = 20 * 1024 * 1024
-        async with httpx.AsyncClient(timeout=25.0, follow_redirects=False) as client:
-            async with client.stream("GET", url, headers=headers) as resp:
-                if resp.status_code != 200:
-                    logger.error("Ошибка скачивания аудио по URL %s: HTTP %d", safe_log_url, resp.status_code)
-                    return None
-                chunks = []
-                total_bytes = 0
-                async for chunk in resp.aiter_bytes(chunk_size=65536):
-                    total_bytes += len(chunk)
-                    if total_bytes > max_bytes:
-                        logger.error("Скачиваемый аудиофайл превышает лимит 20 МБ: %s", safe_log_url)
+        async with asyncio.timeout(25.0):
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=False) as client:
+                async with client.stream("GET", url, headers=headers) as resp:
+                    # Защита от DNS Rebinding (TOCTOU): проверяем реальный IP подключенного сокета
+                    network_stream = resp.extensions.get("network_stream")
+                    if network_stream is not None:
+                        peername = network_stream.get_extra_info("peername") or network_stream.get_extra_info("server_addr")
+                        if peername and isinstance(peername, tuple) and len(peername) >= 1:
+                            actual_ip = ipaddress.ip_address(peername[0])
+                            if not _is_safe_ip(actual_ip):
+                                logger.critical("Заблокирована атака DNS Rebinding на %s (IP сокета: %s)", safe_log_url, actual_ip)
+                                return None
+
+                    if resp.status_code != 200:
+                        logger.error("Ошибка скачивания аудио по URL %s: HTTP %d", safe_log_url, resp.status_code)
                         return None
-                    chunks.append(chunk)
-                return b"".join(chunks)
+                    chunks = []
+                    total_bytes = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        total_bytes += len(chunk)
+                        if total_bytes > max_bytes:
+                            logger.error("Скачиваемый аудиофайл превышает лимит 20 МБ: %s", safe_log_url)
+                            return None
+                        chunks.append(chunk)
+                    return b"".join(chunks)
     except Exception as exc:
         logger.error("Не удалось скачать аудио: %s", exc)
     return None
@@ -1134,8 +1232,15 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
             await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg))
             return
 
-    # 2. Защита от DoS и спама (Rate Limiter по сессии)
-    if not await redis_client.check_rate_limit(session_id, max_requests=settings.RATE_LIMIT_PER_MINUTE):
+    # 2. Двойная защита от DoS и спама: лимит и на сессию/группу, и на конкретного пользователя
+    user_rl_key = f"{platform}:user:{inbound.platform_user_id}"
+    session_allowed = await redis_client.check_rate_limit(
+        session_id, max_requests=settings.RATE_LIMIT_PER_MINUTE
+    )
+    user_allowed = await redis_client.check_rate_limit(
+        user_rl_key, max_requests=settings.RATE_LIMIT_PER_MINUTE
+    )
+    if not session_allowed or not user_allowed:
         await dispatcher.send(OutboundMessage(
             platform=platform,
             chat_id=chat_id,
@@ -1144,8 +1249,13 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
         return
 
     # Блокировка на уровне сессии предотвращает состояние гонки по черновику
-    async with _session_locks[session_id]:
-        action = (inbound.callback_data or "").strip() or (classify_action_text(inbound.text) if inbound.text else None)
+    async with _session_locks.session_context(session_id):
+        raw_callback = (inbound.callback_data or "").strip()
+        # Ограничиваем длину callback_data для защиты от overflow и злоупотреблений
+        if raw_callback and len(raw_callback) > 256:
+            logger.warning("Отклонена аномально длинная callback_data (%d символов) от %s:%s", len(raw_callback), platform, inbound.platform_user_id)
+            raw_callback = ""
+        action = raw_callback or (classify_action_text(inbound.text) if inbound.text else None)
         if action:
             if action == "copilot:confirm":
                 await execute_order_confirmation(session_id, platform, chat_id, inbound.platform_user_id)
@@ -1158,7 +1268,10 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
                 return
             if action.startswith("copilot:del:"):
                 try:
-                    del_idx = int(action.split(":")[-1]) - 1
+                    raw_idx_str = action.split(":")[-1]
+                    if not raw_idx_str.isdigit() or len(raw_idx_str) > 4:
+                        return
+                    del_idx = int(raw_idx_str) - 1
                     draft = await redis_client.get_order_draft(session_id)
                     if draft and draft.get("matched_items"):
                         if not await _apply_cart_delete(session_id, platform, chat_id, draft, del_idx):
@@ -1180,7 +1293,10 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
                     return
             elif action.startswith("copilot:analog:"):
                 try:
-                    idx = int(action.split(":")[-1]) - 1
+                    raw_idx_str = action.split(":")[-1]
+                    if not raw_idx_str.isdigit() or len(raw_idx_str) > 4:
+                        return
+                    idx = int(raw_idx_str) - 1
                     if (draft := await redis_client.get_order_draft(session_id)) and draft.get("matched_items"):
                         if await _apply_analog_swap(session_id, platform, chat_id, draft, idx):
                             return
@@ -1188,7 +1304,10 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
                     logger.warning("Ошибка обработки copilot:analog: %s", exc)
             elif action.startswith("copilot:round:"):
                 try:
-                    idx = int(action.split(":")[-1]) - 1
+                    raw_idx_str = action.split(":")[-1]
+                    if not raw_idx_str.isdigit() or len(raw_idx_str) > 4:
+                        return
+                    idx = int(raw_idx_str) - 1
                     if (draft := await redis_client.get_order_draft(session_id)) and draft.get("matched_items"):
                         if await _apply_round_pack(session_id, platform, chat_id, draft, idx):
                             return
@@ -1218,6 +1337,8 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
                 return
 
         order_text = (recognized_text or inbound.text or "").strip().replace("\x00", "")
+        # Удаляем Unicode control characters (кроме \n и \t) для защиты от Bidi-атак и скрытых инъекций
+        order_text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b-\u200f\u2028-\u202f\u2060-\u206f\ufeff\ufff9-\ufffb]", "", order_text).strip()
         if not order_text:
             await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text="⚠️ Пожалуйста, отправьте заказ текстом или голосовым сообщением."))
             return
@@ -1484,7 +1605,10 @@ async def vk_webhook(request: Request) -> Response:
     elif event_type == "message_event":
         uid = str(obj.get("user_id") or "").strip()
         peer_id = str(obj.get("peer_id") or uid).strip()
-        if ev_id := obj.get("event_id"):
+        ev_id = obj.get("event_id")
+        if ev_id and await _is_duplicate_update_async(f"vk_ev:{uid}:{ev_id}"):
+            return Response(content="ok", media_type="text/plain")
+        if ev_id:
             token = settings.VK_GROUP_TOKEN
             if token and uid.isdigit() and peer_id.lstrip("-").isdigit():
                 async def _ack_vk_event(eid=ev_id, u=int(uid), p=int(peer_id), tok=token):
@@ -1670,7 +1794,8 @@ async def max_webhook(request: Request) -> dict[str, str]:
         if not uid:
             logger.warning("Отклонено сообщение MAX без user_id: %s", data)
             return {"status": "error", "message": "Missing sender user_id"}
-        chat_id = str(msg.get("recipient", {}).get("chat_id") if isinstance(msg.get("recipient"), dict) else uid)
+        recipient_obj = msg.get("recipient") if isinstance(msg.get("recipient"), dict) else {}
+        chat_id = str(recipient_obj.get("chat_id") or uid).strip()
         text = body.get("text")
         raw_atts = body.get("attachments")
         attachments = raw_atts if isinstance(raw_atts, list) else []

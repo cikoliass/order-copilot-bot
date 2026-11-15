@@ -137,7 +137,7 @@ class InboundMessage(BaseModel):
     text: Optional[str] = None
     voice_bytes: Optional[bytes] = None
     voice_url: Optional[str] = None
-    callback_data: Optional[str] = None
+    callback_data: Optional[str] = Field(default=None, max_length=256)
     message_id: Optional[str] = None
 
     @computed_field

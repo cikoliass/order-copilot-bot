@@ -17,10 +17,10 @@ class Settings(BaseSettings):
     APP_ENV: str = Field(default="production", description="Окружение приложения (production/development)")
     APP_PORT: int = Field(default=8001, description="Порт входящего шлюза FastAPI")
     APP_HOST: str = Field(default="127.0.0.1", description="Хост входящего шлюза FastAPI")
-    WEBHOOK_SECRET: str = Field(default="super_secret_webhook_salt_123", description="Секретный ключ вебхуков")
+    WEBHOOK_SECRET: str = Field(default="", description="Секретный ключ вебхуков (ОБЯЗАТЕЛЕН в production)")
     ADMIN_USER_IDS: list[str] = Field(
-        default_factory=lambda: ["admin", "telegram:admin", "telegram:999111"],
-        description="Белый список ID администраторов для сервисных команд (/sync)",
+        default_factory=list,
+        description="Белый список ID администраторов для сервисных команд (/sync). Формат: platform:user_id",
     )
     REQUIRE_CLIENT_AUTH: bool = Field(
         default=False,
@@ -35,8 +35,8 @@ class Settings(BaseSettings):
         description="Максимальное количество входящих сообщений в минуту на одного пользователя",
     )
     ALLOWED_ORIGINS: list[str] = Field(
-        default_factory=lambda: ["*"],
-        description="Список разрешенных CORS origins",
+        default_factory=list,
+        description="Список разрешенных CORS origins (пустой список = запретить все cross-origin запросы)",
     )
     MAX_REQUEST_BODY_SIZE_MB: int = Field(
         default=25,

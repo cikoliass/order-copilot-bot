@@ -363,9 +363,15 @@ async def lifespan(app: FastAPI):
                 secret_param = f"&secret_token={settings.WEBHOOK_SECRET}" if settings.WEBHOOK_SECRET else ""
                 async with httpx.AsyncClient(proxy=settings.TELEGRAM_PROXY, timeout=10.0) as client:
                     res = await client.get(f"https://api.telegram.org/bot{settings.TELEGRAM_BOT_TOKEN}/setWebhook?url={settings.TELEGRAM_WEBHOOK_URL}{secret_param}")
-                    logger.info("Telegram Webhook установлен (%s): %s", settings.TELEGRAM_WEBHOOK_URL, res.json())
+                    res_data = res.json()
+                    # Логируем без URL и токена для предотвращения утечки секретов
+                    logger.info("Telegram Webhook установлен: ok=%s, description=%s", res_data.get("ok"), res_data.get("description", ""))
             except Exception as exc:
-                logger.warning("Не удалось автоматически установить Telegram Webhook: %s", exc)
+                # Редактируем токены из сообщения об ошибке
+                safe_err = str(exc)
+                if settings.TELEGRAM_BOT_TOKEN:
+                    safe_err = safe_err.replace(settings.TELEGRAM_BOT_TOKEN, "***BOT_TOKEN***")
+                logger.warning("Не удалось автоматически установить Telegram Webhook: %s", safe_err)
         elif settings.ENABLE_POLLING_BRIDGES:
             _tg_task = asyncio.create_task(_run_telegram_polling_bridge(settings.TELEGRAM_BOT_TOKEN))
 
@@ -489,37 +495,15 @@ async def root_info() -> dict[str, Any]:
         "service": "B2B HoReCa Order Co-Pilot Enterprise",
         "version": "2.0.0",
         "status": "operational",
-        "stack": {
-            "asr": "Yandex SpeechKit API (152-ФЗ)",
-            "llm": "Yandex Cloud Foundation Models (YandexGPT Pro/Lite)",
-            "fuzzy_matcher": "RapidFuzz (asyncio.to_thread)",
-            "state_storage": "Redis Distributed Lock & Sessions",
-            "resilience": "Transactional Outbox Pattern (SQLite/PostgreSQL)",
-        },
-        "supported_channels": [
-            "POST /webhook/telegram",
-            "POST /webhook/vk",
-            "POST /webhook/whatsapp",
-            "POST /webhook/viber",
-            "POST /webhook/max",
-        ],
     }
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["Health"])
 async def health_check() -> dict[str, Any]:
     redis_alive = await redis_client.ping()
-    try:
-        pending_outbox = await get_pending_outbox_entries(limit=10)
-    except Exception:
-        pending_outbox = []
-
     return {
-        "status": "healthy",
+        "status": "healthy" if redis_alive else "degraded",
         "redis_connected": redis_alive,
-        "catalog_items_loaded": len(catalog_matcher.catalog),
-        "pending_outbox_tasks": len(pending_outbox),
-        "yandex_cloud_configured": bool(settings.YANDEX_API_KEY and settings.YANDEX_FOLDER_ID),
     }
 
 

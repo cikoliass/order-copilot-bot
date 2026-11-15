@@ -116,26 +116,25 @@ class RedisClient:
         return True
 
     async def release_lock(self, key: str, lock_token: Optional[str] = None) -> None:
-        """Безопасное освобождение распределенного лока (не снимает чужой лок)."""
+        """Безопасное освобождение распределенного лока (синхронно в Redis и локальном кэше)."""
         await self._try_reconnect()
         lock_key = f"lock:{key}"
         token = lock_token or self._held_lock_tokens.pop(lock_key, None)
 
         if not token:
-            # Если токен не найден, удаляем только если точно уверены
             return
 
-        if not self._use_fallback and self._redis:
-            try:
-                await self._redis.eval(LUA_RELEASE_LOCK, 1, lock_key, token)
-                return
-            except Exception as exc:
-                logger.warning("Сбой Redis при release_lock: %s", exc)
-
+        # Всегда очищаем локальный fallback-лок, если токен совпадает
         if lock_key in self._in_memory_locks:
             held_token, _ = self._in_memory_locks[lock_key]
             if held_token == token:
                 self._in_memory_locks.pop(lock_key, None)
+
+        if not self._use_fallback and self._redis:
+            try:
+                await self._redis.eval(LUA_RELEASE_LOCK, 1, lock_key, token)
+            except Exception as exc:
+                logger.warning("Сбой Redis при release_lock: %s", exc)
 
     async def set_order_draft(self, session_id: str, data: dict, ttl: int = 86400) -> None:
         """Сохранение черновика заказа сессии в Redis с защитой от переполнения памяти."""

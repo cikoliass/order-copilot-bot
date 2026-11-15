@@ -140,6 +140,10 @@ class CatalogMatcher:
             return best_cand
         return None
 
+    async def find_best_analog_async(self, out_of_stock_sku: CatalogSKU, query: str = "") -> Optional[CatalogSKU]:
+        """Неблокирующий поиск аналога в пуле потоков."""
+        return await asyncio.to_thread(self.find_best_analog, out_of_stock_sku, query)
+
     def reload(self, raw_items: Optional[list[dict[str, Any]]] = None) -> None:
         """Потокобезопасная перезагрузка каталога напрямую из списка товаров Битрикс24 (хранение в RAM)."""
         new_catalog = [CatalogSKU.from_raw(it) for it in raw_items] if raw_items is not None else []
