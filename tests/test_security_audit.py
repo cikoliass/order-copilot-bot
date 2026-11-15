@@ -2,6 +2,7 @@ import asyncio
 from datetime import datetime, timezone, timedelta
 import pytest
 import httpx
+from sqlalchemy import delete
 from app.main import app as main_app
 from app.core.config import settings
 from app.core.database import (
@@ -92,16 +93,20 @@ def test_ssrf_port_8080_and_8443_blocked():
     assert not _is_safe_url_for_download("https://storage.yandexcloud.net:8080/audio.ogg")
     assert not _is_safe_url_for_download("http://storage.yandexcloud.net:8443/audio.ogg")
 
-    # Стандартные порты разрешены
+    # Разрешены только HTTPS ссылки на доверенные хосты (нешифрованный HTTP запрещен)
     assert _is_safe_url_for_download("https://storage.yandexcloud.net/audio.ogg")
     assert _is_safe_url_for_download("https://storage.yandexcloud.net:443/audio.ogg")
-    assert _is_safe_url_for_download("http://storage.yandexcloud.net:80/audio.ogg")
+    assert not _is_safe_url_for_download("http://storage.yandexcloud.net:80/audio.ogg")
 
 
 @pytest.mark.asyncio
 async def test_outbox_expired_lease_reclaim():
     """Тест 3: Восстановление зависших в PROCESSING задач Outbox после падения воркера."""
     await init_db()
+    async with async_session_factory() as session:
+        await session.execute(delete(OrderOutbox))
+        await session.commit()
+
     entry = await create_outbox_entry(
         session_id="test:reclaim_worker",
         destination="1C",

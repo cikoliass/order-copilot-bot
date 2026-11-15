@@ -198,6 +198,18 @@ class RedisClient:
 
         self._in_memory_fallback.pop(key, None)
 
+    async def check_and_set_dedup(self, update_key: str, ttl_sec: int = 300) -> bool:
+        """Возвращает True, если апдейт УЖЕ обрабатывался (дубликат)."""
+        await self._try_reconnect()
+        key = f"dedup:upd:{update_key}"
+        if not self._use_fallback and self._redis:
+            try:
+                created = await self._redis.set(key, "1", nx=True, ex=ttl_sec)
+                return not bool(created)
+            except Exception as exc:
+                logger.warning("Сбой Redis при дедупликации апдейта: %s", exc)
+        return False
+
     # Управление стоп-листом и остатками (персистентность между рестартами)
     async def add_stop_list_item(self, sku_id: str) -> None:
         await self._try_reconnect()

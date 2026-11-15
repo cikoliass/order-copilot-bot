@@ -78,7 +78,13 @@ async def create_order_in_1c(order: Mock1COrderRequest) -> Mock1COrderResponse:
         "items": [item.model_dump() for item in order.items],
     }
     SAVED_ORDERS.insert(0, order_record)
+    if len(SAVED_ORDERS) > 1000:
+        SAVED_ORDERS.pop()
+
     if order.idempotency_key:
+        if len(IDEMPOTENCY_STORE) >= 2000:
+            oldest_key = next(iter(IDEMPOTENCY_STORE))
+            IDEMPOTENCY_STORE.pop(oldest_key, None)
         IDEMPOTENCY_STORE[order.idempotency_key] = order_record
 
     logger.info("1С: Создан документ %s на сумму %.2f руб. от клиента %s", doc_num, total_amount, order.client_id)

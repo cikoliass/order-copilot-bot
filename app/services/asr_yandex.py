@@ -8,6 +8,7 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 MAX_AUDIO_BYTES = 20 * 1024 * 1024  # 20 МБ лимит для защиты от OOM и DoS
+_ffmpeg_semaphore = asyncio.Semaphore(2)
 
 
 def detect_audio_format(audio_bytes: bytes) -> str:
@@ -35,8 +36,10 @@ def _convert_audio_with_ffmpeg(audio_bytes: bytes) -> tuple[bytes, str]:
             [
                 "ffmpeg", "-y",
                 "-nostdin",
+                "-threads", "1",
                 "-protocol_whitelist", "pipe",
                 "-i", "pipe:0",
+                "-t", "120",  # Максимум 2 минуты голосового заказа
                 "-vn",
                 "-c:a", "libopus",
                 "-b:a", "32k",
@@ -51,7 +54,7 @@ def _convert_audio_with_ffmpeg(audio_bytes: bytes) -> tuple[bytes, str]:
         if proc.returncode == 0 and converted:
             logger.info("ffmpeg: успешно извлечен и сконвертирован звук (%d байт).", len(converted))
             return converted, "oggopus"
-        logger.warning("ffmpeg конвертация вернула код %s: %s", proc.returncode, err[:200] if err else "")
+        logger.warning("ffmpeg конвертация вернула код %s", proc.returncode)
     except subprocess.TimeoutExpired:
         if proc:
             proc.kill()
@@ -93,7 +96,8 @@ async def transcribe_voice_yandex(
         audio_format = detected
     else:
         # Для видео-кружочков (mp4), webm, m4a конвертируем в OGG Opus
-        audio_bytes, audio_format = await asyncio.to_thread(_convert_audio_with_ffmpeg, audio_bytes)
+        async with _ffmpeg_semaphore:
+            audio_bytes, audio_format = await asyncio.to_thread(_convert_audio_with_ffmpeg, audio_bytes)
 
     headers = {
         "Authorization": f"Api-Key {api_key}",

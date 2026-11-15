@@ -217,6 +217,7 @@ async def claim_outbox_entries(limit: int = 20) -> list[OrderOutbox]:
             )
             .order_by(OrderOutbox.id.asc())
             .limit(limit)
+            .with_for_update(skip_locked=True)
         )
         result = await session.execute(stmt)
         entries = list(result.scalars().all())

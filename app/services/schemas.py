@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, computed_field
 
 
@@ -24,8 +24,8 @@ class ExtractedOrder(BaseModel):
     """Структурированный заказ, извлеченный LLM."""
     model_config = ConfigDict(extra="ignore")
 
-    delivery_date: Optional[str] = Field(default=None, description="Желаемая дата/время доставки")
-    items: list[RawItem] = Field(default_factory=list, description="Список товарных позиций")
+    delivery_date: Optional[str] = Field(default=None, max_length=100, description="Желаемая дата/время доставки")
+    items: list[RawItem] = Field(default_factory=list, max_length=50, description="Список товарных позиций")
 
 
 class CatalogSKU(BaseModel):
@@ -190,10 +190,13 @@ class CartIntentResult(BaseModel):
     """Результат ИИ-анализа намерения шеф-повара относительно активной корзины."""
     model_config = ConfigDict(extra="ignore")
 
-    action: str = "unknown"  # "remove", "update", "add", "confirm", "cancel", "new_order", "unknown"
-    target_item: Optional[str] = None
-    new_quantity: Optional[float] = None
-    new_unit: Optional[str] = None
-    items_to_add: list[Any] = Field(default_factory=list)
-    delivery_date: Optional[str] = None
+    action: Literal[
+        "remove", "update", "add", "confirm", "cancel",
+        "new_order", "swap_analog", "round_pack", "unknown"
+    ] = "unknown"
+    target_item: Optional[str] = Field(default=None, max_length=255)
+    new_quantity: Optional[float] = Field(default=None, ge=0.0, le=50000.0)
+    new_unit: Optional[str] = Field(default=None, max_length=32)
+    items_to_add: list[Any] = Field(default_factory=list, max_length=50)
+    delivery_date: Optional[str] = Field(default=None, max_length=100)
 

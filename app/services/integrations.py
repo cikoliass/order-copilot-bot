@@ -29,6 +29,17 @@ from app.services.schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _sanitize_error_msg(err: Exception | str) -> str:
+    """Удаляет секретные URL вебхуков Битрикс24 и учетные данные из текста ошибок."""
+    msg = str(err)
+    if settings.BITRIX_WEBHOOK_URL:
+        msg = msg.replace(settings.BITRIX_WEBHOOK_URL.rstrip("/"), "https://***BITRIX_REDACTED***")
+    if settings.ONEC_PASSWORD:
+        msg = msg.replace(settings.ONEC_PASSWORD, "***")
+    msg = re.sub(r"https?://[^\s/]+/rest/\d+/[^/\s]+", "https://***/rest/***/***", msg)
+    return msg[:500]
+
+
 def resolve_delivery_date(raw_date: Optional[str]) -> str:
     """Преобразует относительные даты («на завтра», «сегодня») в фиксированную дату с днем недели."""
     if not raw_date:
@@ -179,8 +190,9 @@ class IntegrationsService:
                 doc_1c = await self._send_to_1c(client_id, items, delivery_date, idempotency_key=idempotency_key)
                 docs.append(doc_1c)
             except Exception as exc:
-                logger.warning("Сбой отправки заказа в 1С: %s", exc)
-                errors.append(f"1C: {exc}")
+                sanitized_err = _sanitize_error_msg(exc)
+                logger.warning("Сбой отправки заказа в 1С: %s", sanitized_err)
+                errors.append(f"1C: {sanitized_err}")
 
         if not any("Б24-" in str(d) for d in docs):
             try:
@@ -188,8 +200,9 @@ class IntegrationsService:
                 if doc_b24 != "Б24-DISABLED":
                     docs.append(doc_b24)
             except Exception as exc:
-                logger.warning("Сбой отправки заказа в Битрикс24: %s", exc)
-                errors.append(f"Битрикс24: {exc}")
+                sanitized_err = _sanitize_error_msg(exc)
+                logger.warning("Сбой отправки заказа в Битрикс24: %s", sanitized_err)
+                errors.append(f"Битрикс24: {sanitized_err}")
 
         return docs, errors
 
@@ -202,6 +215,7 @@ class IntegrationsService:
         order_id: Optional[int] = None,
         platform: str = "telegram",
         chat_id: str = "",
+        counterparty_1c_id: Optional[str] = None,
     ) -> IntegrationResult:
         """Единая точка выгрузки подтвержденного заказа с Outbox-фоллбэком."""
         resolved_date = resolve_delivery_date(delivery_date)
@@ -218,7 +232,7 @@ class IntegrationsService:
             for it in valid_items
         ]
         total_amount = sum(it.total_sum for it in valid_items)
-        client_id = clean_client_id
+        client_id = str(counterparty_1c_id).strip() if counterparty_1c_id else clean_client_id
 
         # Формируем уникальный ключ идемпотентности: включаем order_id, чтобы два разных заказа
         # одного клиента с одинаковым составом на один день не слипались в 1С
@@ -344,11 +358,12 @@ async def run_outbox_worker() -> None:
                             # Важно: сохраняем обновленный payload с completed_docs, чтобы не дублировать 1С при следующей попытке!
                             await mark_outbox_failure(entry.id, "; ".join(errors), updated_payload=payload)
                     except Exception as entry_err:
-                        logger.error("Сбой обработки Outbox entry #%d: %s", entry.id, entry_err)
+                        safe_entry_err = _sanitize_error_msg(entry_err)
+                        logger.error("Сбой обработки Outbox entry #%d: %s", entry.id, safe_entry_err)
                         try:
-                            await mark_outbox_failure(entry.id, f"Ошибка обработки записи: {entry_err}")
+                            await mark_outbox_failure(entry.id, f"Ошибка обработки записи: {safe_entry_err}")
                         except Exception as fatal_err:
-                            logger.critical("Не удалось зафиксировать сбой Outbox #%d: %s", entry.id, fatal_err)
+                            logger.critical("Не удалось зафиксировать сбой Outbox #%d: %s", entry.id, _sanitize_error_msg(fatal_err))
             finally:
                 await redis_client.release_lock("outbox_worker_leader", lock_token=lock_token)
         except asyncio.CancelledError:

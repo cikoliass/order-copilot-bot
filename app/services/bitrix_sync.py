@@ -130,7 +130,8 @@ async def sync_catalog_from_bitrix() -> list[dict[str, Any]]:
                 else:
                     break
             except Exception as exc:
-                logger.error("Сетевая ошибка при обращении к Битрикс24: %s", exc)
+                from app.services.integrations import _sanitize_error_msg
+                logger.error("Сетевая ошибка при обращении к Битрикс24: %s", _sanitize_error_msg(exc))
                 break
 
     if not products_b24:

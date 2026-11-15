@@ -6,7 +6,7 @@ services:
     container_name: order_copilot_backend
     command: python -m app.main
     ports:
-      - "8001:8001"
+      - "127.0.0.1:8001:8001"
     env_file:
       - .env
     environment:
@@ -26,7 +26,7 @@ services:
     container_name: order_copilot_mock_1c
     command: python -m mock_server.main
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     restart: unless-stopped
 
   redis:

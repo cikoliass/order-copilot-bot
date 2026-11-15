@@ -124,8 +124,15 @@ def _fmt_msg(platform: str, plain: str, html_text: str) -> str:
 
 
 def _is_duplicate_update(update_key: str) -> bool:
-    """Дедупликация входящих вебхук-апдейтов через кольцевой буфер с O(1) добавлением."""
+    """Синхронная дедупликация через локальный кольцевой буфер (для обратной совместимости)."""
     return _update_deduplicator.is_duplicate_and_add(update_key)
+
+
+async def _is_duplicate_update_async(update_key: str) -> bool:
+    """Глобальная дедупликация через Redis + локальный кольцевой буфер."""
+    if _update_deduplicator.is_duplicate_and_add(update_key):
+        return True
+    return await redis_client.check_and_set_dedup(update_key, ttl_sec=300)
 
 
 def verify_webhook_auth(
@@ -646,6 +653,32 @@ async def execute_order_confirmation(
 
         all_items = [MatchedItem.model_validate(it) for it in draft["matched_items"]]
 
+        # Актуализация остатков, стоп-листа и цен по живому каталогу перед отправкой в 1С
+        cat_map = {sku.sku_id: sku for sku in catalog_matcher.catalog}
+        cart_changed_by_sync = False
+        for it in all_items:
+            if it.sku_id and it.sku_id in cat_map:
+                live_sku = cat_map[it.sku_id]
+                live_stock = catalog_matcher.get_stock(live_sku)
+                if live_stock <= 0 or it.sku_id in catalog_matcher._stop_list:
+                    it.is_out_of_stock = True
+                    it.status = MatchStatus.OUT_OF_STOCK
+                    analog = catalog_matcher.find_best_analog(live_sku, query=it.raw_name)
+                    if analog:
+                        it.suggested_analog_sku = analog.sku_id
+                        it.suggested_analog_name = analog.name
+                        it.suggested_analog_price = analog.price
+                        it.suggested_analog_unit = analog.base_unit
+                    cart_changed_by_sync = True
+                if live_sku.price > 0 and not math.isclose(it.price, live_sku.price, rel_tol=1e-4):
+                    it.price = live_sku.price
+                    it.total_sum = round(it.final_quantity * live_sku.price, 2)
+                    cart_changed_by_sync = True
+
+        if cart_changed_by_sync:
+            draft["matched_items"] = [it.model_dump() for it in all_items]
+            await redis_client.set_order_draft(session_id, draft)
+
         # 1. Блокировка: товары отсутствуют на складе
         oos_items = [it for it in all_items if it.status == MatchStatus.OUT_OF_STOCK or it.is_out_of_stock]
         if oos_items:
@@ -730,6 +763,15 @@ async def execute_order_confirmation(
             document_number_1c=None,
         )
 
+        client_1c_id = None
+        try:
+            from app.core.database import get_client_binding
+            binding = await get_client_binding(platform, platform_user_id)
+            if binding and binding.counterparty_1c_id:
+                client_1c_id = binding.counterparty_1c_id
+        except Exception as bind_err:
+            logger.warning("Не удалось получить привязку клиента для 1С: %s", bind_err)
+
         result = await integrations_service.send_order(
             session_id=session_id,
             valid_items=valid_items,
@@ -738,6 +780,7 @@ async def execute_order_confirmation(
             order_id=order_record.id,
             platform=platform,
             chat_id=chat_id,
+            counterparty_1c_id=client_1c_id,
         )
 
         # Обновляем статус заказа в БД с защитой от сбоев
@@ -802,7 +845,12 @@ async def try_handle_cart_edit(
         except (ValueError, OverflowError):
             pass
 
-    if (m := re.match(r"^(?:copilot:analog:(\d+)|(?:замени|давай|положи|возьми)\s+(?:поз(?:ицию)?\s*)?#?(\d+)?\s*(?:на\s+)?аналог.*)$", raw_lower)) or "аналог" in raw_lower:
+    has_negation = any(re.search(pat, raw_lower) for pat in NEGATION_PATTERNS)
+
+    if not has_negation and (
+        (m := re.match(r"^(?:copilot:analog:(\d+)|(?:замени|давай|положи|возьми)\s+(?:поз(?:ицию)?\s*)?#?(\d+)?\s*(?:на\s+)?аналог.*)$", raw_lower))
+        or re.search(r"\b(?:давай|положи|возьми|замени\s+на)\s+аналог\b", raw_lower)
+    ):
         try:
             idx = int(m.group(1) or m.group(2)) - 1 if m and (m.group(1) or m.group(2)) else -1
             if await _apply_analog_swap(session_id, platform, chat_id, draft, idx):
@@ -810,7 +858,10 @@ async def try_handle_cart_edit(
         except (ValueError, OverflowError):
             pass
 
-    if (m := re.match(r"^(?:copilot:round:(\d+)|(?:округли|кратно|добавь\s+до\s+пачки)\s*(?:поз(?:ицию)?\s*)?#?(\d+)?.*)$", raw_lower)) or "округли" in raw_lower:
+    if not has_negation and (
+        (m := re.match(r"^(?:copilot:round:(\d+)|(?:округли|кратно|добавь\s+до\s+пачки)\s*(?:поз(?:ицию)?\s*)?#?(\d+)?.*)$", raw_lower))
+        or re.search(r"^(?:округли|давай\s+кратно|округляй)\b", raw_lower)
+    ):
         try:
             idx = int(m.group(1) or m.group(2)) - 1 if m and (m.group(1) or m.group(2)) else -1
             if await _apply_round_pack(session_id, platform, chat_id, draft, idx):
@@ -928,62 +979,63 @@ def _is_safe_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
     return True
 
 
+ALLOWED_MEDIA_HOSTS = frozenset({
+    "api.telegram.org",
+    "psv4.userapi.com",
+    "platform-api2.max.ru",
+    "dl-media.viber.com",
+    "media.green-api.com",
+    "storage.yandexcloud.net",
+})
+
+ALLOWED_MEDIA_SUFFIXES = (
+    ".userapi.com",
+    ".vkuseraudio.net",
+    ".greenapi.com",
+    ".green-api.com",
+    ".viber.com",
+)
+
+
 def _is_safe_url_for_download(url: str) -> bool:
-    """
-    Защита от SSRF (Server-Side Request Forgery) и запросов к локальным/внутренним сетям.
-    Проверяет протокол, порт, отсутствие учетных данных в URL и резолвит DNS-записи,
-    блокируя доступ к приватным, loopback, link-local и reserved IP (включая DNS rebinding).
-    """
+    """Строгая проверка URL: только HTTPS, только доверенные CDN мессенджеров и безопасные IP."""
     try:
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme != "https":
             return False
-
         if parsed.username or parsed.password:
             return False
 
-        hostname = parsed.hostname
+        hostname = (parsed.hostname or "").strip().lower()
         if not hostname:
             return False
 
-        hostname_clean = hostname.strip().lower()
-        if hostname_clean in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        if parsed.port and parsed.port != 443:
             return False
 
-        if parsed.port and parsed.port not in (80, 443):
+        is_allowed_host = (
+            hostname in ALLOWED_MEDIA_HOSTS
+            or any(hostname.endswith(sfx) for sfx in ALLOWED_MEDIA_SUFFIXES)
+        )
+        if not is_allowed_host:
             return False
 
-        # Если hostname передан как чистый IP-адрес
-        try:
-            ip = ipaddress.ip_address(hostname_clean)
-            return _is_safe_ip(ip)
-        except ValueError:
-            pass
-
-        # Если hostname — доменное имя, резолвим DNS для защиты от DNS rebinding
-        try:
-            addr_info = socket.getaddrinfo(hostname_clean, None)
-            if not addr_info:
+        addr_info = socket.getaddrinfo(hostname, 443)
+        if not addr_info:
+            return False
+        for item in addr_info:
+            ip_cand = ipaddress.ip_address(item[4][0])
+            if not _is_safe_ip(ip_cand):
                 return False
-            for item in addr_info:
-                sockaddr = item[4]
-                ip_str = sockaddr[0]
-                ip_cand = ipaddress.ip_address(ip_str)
-                if not _is_safe_ip(ip_cand):
-                    return False
-        except (socket.gaierror, socket.herror, ValueError):
-            return False
-
         return True
     except Exception:
         return False
 
 
 async def _download_audio(url: str) -> bytes | None:
-    """Безопасное скачивание аудио с защитой от SSRF, неблокирующим DNS-резолвингом и санитизацией логов."""
     is_safe = await asyncio.to_thread(_is_safe_url_for_download, url)
     if not is_safe:
-        logger.error("Заблокирована попытка SSRF по URL: %s", url)
+        logger.error("Заблокирована попытка скачивания с недоверенного URL: %s", url)
         return None
 
     try:
@@ -991,13 +1043,11 @@ async def _download_audio(url: str) -> bytes | None:
         hostname = (parsed.hostname or "").lower()
         safe_log_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
 
-        # Токен MAX передается ТОЛЬКО на доверенный домен max.ru, а не на evil.com?max.ru
+        expected_max_host = urllib.parse.urlparse(settings.MAX_API_BASE_URL).hostname or "platform-api2.max.ru"
         headers = {}
-        if settings.MAX_BOT_TOKEN and (hostname == "platform-api2.max.ru" or hostname == "max.ru" or hostname.endswith(".max.ru")):
+        if settings.MAX_BOT_TOKEN and hostname == expected_max_host.lower():
             headers["Authorization"] = settings.MAX_BOT_TOKEN
 
-        # follow_redirects=False исключает обход SSRF через HTTP 302 редиректы на внутренние адреса
-        # Стриминговое скачивание с защитой от OOM (ранний обрыв при превышении 20 МБ)
         max_bytes = 20 * 1024 * 1024
         async with httpx.AsyncClient(timeout=25.0, follow_redirects=False) as client:
             async with client.stream("GET", url, headers=headers) as resp:
@@ -1066,22 +1116,20 @@ async def _process_inbound_core_impl(inbound: InboundMessage) -> None:
     # 1. Валидация B2B-контрагента (при включенном флаге REQUIRE_CLIENT_AUTH)
     if settings.REQUIRE_CLIENT_AUTH and settings.APP_ENV != "test":
         from app.core.database import get_client_binding
-        client = await get_client_binding(platform, inbound.platform_user_id) or (
-            await get_client_binding(platform, inbound.chat_id) if inbound.chat_id != inbound.platform_user_id else None
-        )
+        client = await get_client_binding(platform, inbound.platform_user_id)
         if not client:
             if (inbound.text or "").strip().lower() in ("/start", "start"):
                 msg = (
                     "👋 <b>Добро пожаловать в B2B HoReCa Order Co-Pilot!</b>\n\n"
                     "Ваш аккаунт еще не привязан к договору поставки.\n"
-                    f"Ваш ID: <code>{html.escape(inbound.platform_user_id)}</code> ({platform}).\n\n"
+                    f"Ваш личный ID: <code>{html.escape(inbound.platform_user_id)}</code> ({platform}).\n\n"
                     "Передайте этот ID вашему персональному менеджеру для привязки карточки ресторана."
                 )
             else:
                 msg = (
                     "🔒 <b>Доступ заблокирован</b>\n\n"
                     "Вы не авторизованы как представитель контрагента.\n"
-                    f"Передайте менеджеру ваш ID: <code>{html.escape(inbound.platform_user_id)}</code> ({platform}) для привязки к ИНН."
+                    f"Передайте менеджеру ваш личный ID: <code>{html.escape(inbound.platform_user_id)}</code> ({platform}) для привязки к ИНН."
                 )
             await dispatcher.send(OutboundMessage(platform=platform, chat_id=chat_id, text=msg))
             return
@@ -1323,7 +1371,7 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Expected JSON object")
 
     if update_id := data.get("update_id"):
-        if _is_duplicate_update(f"tg:{update_id}"):
+        if await _is_duplicate_update_async(f"tg:{update_id}"):
             return {"ok": True}
 
     inbound = None
@@ -1413,7 +1461,7 @@ async def vk_webhook(request: Request) -> Response:
         if not isinstance(msg, dict):
             msg = {}
         msg_id = msg.get("id") or msg.get("conversation_message_id")
-        if msg_id and _is_duplicate_update(f"vk:{msg_id}"):
+        if msg_id and await _is_duplicate_update_async(f"vk:{msg_id}"):
             return Response(content="ok", media_type="text/plain")
 
         uid = str(msg.get("from_id") or "").strip()
@@ -1492,7 +1540,7 @@ async def whatsapp_webhook(request: Request) -> dict[str, str]:
         return {"status": "ok"}
 
     msg_id = data.get("idMessage") or data.get("receiptId")
-    if msg_id and _is_duplicate_update(f"wa:{msg_id}"):
+    if msg_id and await _is_duplicate_update_async(f"wa:{msg_id}"):
         return {"status": "ok"}
 
     raw_mdata = data.get("messageData")
@@ -1565,7 +1613,7 @@ async def viber_webhook(
         return {"status": 0, "message": "ok"}
 
     msg_token = data.get("message_token")
-    if msg_token and _is_duplicate_update(f"viber:{msg_token}"):
+    if msg_token and await _is_duplicate_update_async(f"viber:{msg_token}"):
         return {"status": 0}
 
     if data.get("event") == "message":
@@ -1608,7 +1656,7 @@ async def max_webhook(request: Request) -> dict[str, str]:
         or data.get("callback_id")
         or body_obj.get("message_id")
     )
-    if update_key and _is_duplicate_update(f"max:{update_key}"):
+    if update_key and await _is_duplicate_update_async(f"max:{update_key}"):
         return {"status": "ok"}
 
     uid, chat_id, text, voice_url, callback_data = "", "", None, None, None
