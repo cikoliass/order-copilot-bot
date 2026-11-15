@@ -13,3 +13,4 @@ orders_enterprise.db
 .pytest_cache/
 *.log
 *.zip
+project_codebase.txt
